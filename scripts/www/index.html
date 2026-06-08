@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>无限画布 | 图钉大纲 | 底部固定互动框 | 互动图钉蓝色高亮</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            font-family: 'PingFang SC', 'Microsoft YaHei', 'Hei', 'Helvetica Neue', 'Noto Sans CJK SC', 'Segoe UI', sans-serif;
+        }
+        body { overflow: hidden; background-color: #eef2f6; }
+        .canvas-stack { position: fixed; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden; }
+        canvas { display: block; position: absolute; top: 0; left: 0; }
+        #c-a { background-color: #f8f9fc; pointer-events: none; }
+        #c-b { background: transparent; cursor: none; touch-action: none; }
+        .custom-cursor { position: fixed; pointer-events: none; z-index: 9999; transform: translate(-50%, -50%); border-radius: 50%; background-color: rgba(0,0,0,0); border: 2px solid rgba(0,0,0,0.7); box-shadow: 0 0 0 1px rgba(255,255,255,0.3), inset 0 0 0 1px rgba(255,255,255,0.2); transition: width 0.05s ease, height 0.05s ease; will-change: left, top, width, height; display: none; }
+        .custom-cursor.pencil-mode { border-color: #1e293b; }
+        .custom-cursor.eraser-mode { border-color: #64748b; background-color: rgba(100,116,139,0.15); }
+        .custom-cursor.lasso-mode { border-color: #3b82f6; border-style: dashed; }
+        .custom-cursor.pin-mode { border-color: #f1c40f; background-color: rgba(241,196,15,0.2); border-style: solid; width: 24px !important; height: 24px !important; border-radius: 50%; transform: translate(-50%, -50%); }
+        .toolbar { position: fixed; left: 24px; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.6); backdrop-filter: blur(20px); border-radius: 56px; padding: 12px 16px; display: flex; flex-direction: column; gap: 12px; align-items: center; box-shadow: 0 8px 24px rgba(0,0,0,0.08); border: 1px solid rgba(255,255,255,0.8); z-index: 1000; }
+        .panel { position: fixed; right: 24px; top: 50%; transform: translateY(-50%); width: 240px; max-height: 70vh; background: rgba(255,255,255,0.7); backdrop-filter: blur(20px); border-radius: 28px; padding: 16px 12px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); border: 1px solid rgba(255,255,255,0.8); z-index: 1000; pointer-events: auto; overflow: hidden; }
+        .panel-header { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid rgba(0,0,0,0.1); margin-bottom: 8px; }
+        .panel-header span:first-child { font-size: 1.3rem; }
+        .panel-header .title { font-weight: 700; font-size: 0.9rem; color: #1e293b; letter-spacing: 1px; background: rgba(0,0,0,0.05); padding: 4px 12px; border-radius: 40px; }
+        .pin-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; max-height: 60vh; padding-right: 4px; }
+        .pin-list::-webkit-scrollbar { width: 4px; }
+        .pin-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 4px; }
+        .pin-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 4px; }
+        .pin-item { display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.5); backdrop-filter: blur(4px); border-radius: 60px; padding: 6px 8px 6px 12px; transition: all 0.15s; border: 1px solid rgba(255,255,255,0.6); cursor: pointer; }
+        .pin-item:hover { background: rgba(255,255,255,0.8); transform: translateX(2px); border-color: #f1c40f; }
+        .pin-info { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; font-weight: 500; color: #1e293b; pointer-events: none; flex:1; overflow: hidden; }
+        .pin-icon { font-size: 0.9rem; flex-shrink: 0; }
+        .pin-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; background: rgba(0,0,0,0.04); padding: 2px 6px; border-radius: 40px; max-width: 100px; }
+        .pin-level-badge { font-size: 0.65rem; background: rgba(0,0,0,0.1); border-radius: 20px; padding: 2px 6px; margin-left: 4px; }
+        .empty-pins { text-align: center; padding: 24px 12px; font-size: 0.75rem; color: #64748b; background: rgba(0,0,0,0.03); border-radius: 32px; margin-top: 8px; }
+        .tool-btn, .file-btn { background: rgba(255,255,255,0.3); border: none; color: #1e293b; font-size: 1.3rem; width: 48px; height: 48px; border-radius: 40px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s ease; font-weight: 500; backdrop-filter: blur(4px); }
+        .file-btn { font-size: 1rem; }
+        .tool-btn.active { background: #3b82f6; color: white; box-shadow: 0 0 12px rgba(59,130,246,0.3); }
+        .tool-btn.pin-active { background: #f1c40f; color: #7d3c00; box-shadow: 0 0 12px rgba(241,196,15,0.5); }
+        .tool-btn:hover:not(.active), .file-btn:hover { background: rgba(255,255,255,0.6); transform: scale(1.02); }
+        .separator { width: 32px; height: 1px; background: rgba(0,0,0,0.15); margin: 4px 0; }
+        .brush-panel { position: fixed; background: rgba(255,255,255,0.7); backdrop-filter: blur(20px); border-radius: 48px; padding: 10px 20px; display: none; align-items: center; gap: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid rgba(255,255,255,0.9); z-index: 1001; white-space: nowrap; }
+        .brush-panel.show { display: flex; }
+        .brush-label { font-size: 0.85rem; font-weight: 600; color: #1e293b; background: rgba(0,0,0,0.05); padding: 4px 12px; border-radius: 40px; }
+        .brush-slider-container { display: flex; align-items: center; gap: 12px; }
+        .brush-slider { width: 140px; cursor: pointer; background: #cbd5e1; height: 4px; border-radius: 4px; -webkit-appearance: none; }
+        .brush-slider:focus { outline: none; }
+        .brush-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #1e293b; border-radius: 50%; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+        .brush-value { background: rgba(0,0,0,0.1); padding: 4px 12px; border-radius: 32px; font-size: 0.8rem; font-family: monospace; font-weight: bold; color: #1e293b; min-width: 50px; text-align: center; }
+        .smooth-container { position: fixed; top: 24px; right: 24px; z-index: 1000; }
+        .smooth-trigger { background: rgba(255,255,255,0.7); backdrop-filter: blur(20px); border-radius: 48px; padding: 8px 20px; font-size: 0.85rem; font-weight: 600; color: #1e293b; cursor: pointer; transition: 0.2s; border: 1px solid rgba(255,255,255,0.9); box-shadow: 0 4px 12px rgba(0,0,0,0.08); display: inline-block; }
+        .smooth-trigger:hover { background: rgba(255,255,255,0.9); }
+        .smooth-dropdown { position: absolute; top: 52px; right: 0; background: rgba(255,255,255,0.95); backdrop-filter: blur(20px); border-radius: 28px; padding: 8px 0; min-width: 120px; box-shadow: 0 8px 20px rgba(0,0,0,0.15); border: 1px solid rgba(255,255,255,0.9); display: none; flex-direction: column; z-index: 1001; }
+        .smooth-dropdown.show { display: flex; }
+        .smooth-option { padding: 10px 20px; font-size: 0.85rem; font-weight: 500; color: #1e293b; cursor: pointer; transition: 0.1s; text-align: center; }
+        .smooth-option:hover { background: rgba(0,0,0,0.05); }
+        .smooth-option.selected { background: rgba(59,130,246,0.2); color: #3b82f6; font-weight: 600; }
+        .zoom-indicator { position: fixed; bottom: 24px; right: 24px; background: rgba(255,255,255,0.7); backdrop-filter: blur(20px); padding: 8px 20px; border-radius: 40px; font-size: 0.9rem; font-weight: 600; color: #1e293b; pointer-events: none; z-index: 1000; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid rgba(255,255,255,0.8); }
+        
+        /* 图钉操作面板 — 固定在底部居中 */
+        .pin-edit-panel {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(20px);
+            border-radius: 56px;
+            padding: 8px 20px;
+            min-width: 200px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+            border: 1px solid rgba(255,255,255,0.9);
+            z-index: 1002;
+            display: none;
+            flex-direction: row;
+            gap: 16px;
+            pointer-events: auto;
+            align-items: center;
+            justify-content: center;
+        }
+        .pin-edit-panel.show {
+            display: flex;
+        }
+        .pin-action-btn {
+            background: rgba(0, 0, 0, 0.05);
+            border: none;
+            border-radius: 40px;
+            padding: 8px 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #1e293b;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            backdrop-filter: blur(4px);
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+        .pin-action-btn:hover {
+            background: rgba(0, 0, 0, 0.12);
+            transform: scale(1.02);
+        }
+        .pin-action-btn.delete-btn {
+            background: rgba(220, 38, 38, 0.15);
+            color: #b91c1c;
+        }
+        .pin-action-btn.delete-btn:hover {
+            background: rgba(220, 38, 38, 0.3);
+            color: #991b1b;
+        }
+        /* 分级下拉菜单 */
+        .level-menu {
+            position: fixed;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(24px);
+            border-radius: 28px;
+            padding: 8px 0;
+            min-width: 110px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+            border: 1px solid rgba(255,255,255,0.8);
+            z-index: 1003;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .level-option {
+            padding: 10px 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #1e293b;
+            cursor: pointer;
+            transition: 0.1s;
+            text-align: center;
+        }
+        .level-option:hover {
+            background: rgba(59,130,246,0.2);
+            color: #2563eb;
+        }
+        /* 模态命名弹窗 — 居中，白色毛玻璃 */
+        .pin-name-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 1005;
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(24px);
+            border-radius: 48px;
+            padding: 20px 32px;
+            box-shadow: 0 20px 35px rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.9);
+            min-width: 280px;
+        }
+        .pin-name-modal input {
+            background: rgba(0, 0, 0, 0.04);
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            border-radius: 60px;
+            padding: 12px 20px;
+            font-size: 1rem;
+            color: #1e293b;
+            outline: none;
+            width: 100%;
+            text-align: center;
+            font-weight: 500;
+            transition: 0.2s;
+        }
+        .pin-name-modal input:focus {
+            border-color: #f1c40f;
+            background: rgba(255,255,255,0.6);
+            box-shadow: 0 0 0 2px rgba(241,196,15,0.3);
+        }
+        .pin-name-modal input::placeholder {
+            color: #94a3b8;
+        }
+        .modal-mask {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(6px);
+            z-index: 1004;
+            pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+<div class="canvas-stack">
+    <canvas id="c-a"></canvas>
+    <canvas id="c-b"></canvas>
+</div>
+<div class="custom-cursor" id="customCursor"></div>
+
+<div class="toolbar">
+    <button class="file-btn" id="saveBtn" title="保存画布">💾</button>
+    <button class="file-btn" id="importBtn" title="导入画布">📂</button>
+    <input type="file" id="fileInput" accept=".infcanvas,application/json" style="display: none;">
+    <div class="separator"></div>
+    <button class="tool-btn" id="pencilBtn" title="铅笔 (Q)">✏️</button>
+    <button class="tool-btn" id="eraserBtn" title="橡皮 (E) 直接擦除笔画">🧽</button>
+    <button class="tool-btn" id="lassoBtn" title="套索 (L)">🪢</button>
+    <button class="tool-btn" id="pinBtn" title="图钉 (P)">📌</button>
+</div>
+
+<div class="panel">
+    <div class="panel-header">
+        <span>📌</span>
+        <span class="title">图钉大纲</span>
+    </div>
+    <div id="pinListContainer" class="pin-list">
+        <div class="empty-pins">暂无图钉<br>点击 📌 放置图钉</div>
+    </div>
+</div>
+
+<div id="pinEditPanel" class="pin-edit-panel"></div>
+
+<div id="brushPanel" class="brush-panel">
+    <div class="brush-label" id="brushLabel">笔刷粗细</div>
+    <div class="brush-slider-container">
+        <input type="range" id="brushSizeSlider" class="brush-slider" min="1" max="40" step="1" value="8">
+        <span class="brush-value" id="brushSizeValue">8</span>
+    </div>
+</div>
+<div class="smooth-container">
+    <div class="smooth-trigger" id="smoothTrigger">防抖 50%</div>
+    <div class="smooth-dropdown" id="smoothDropdown">
+        <div class="smooth-option" data-value="0">0%</div>
+        <div class="smooth-option" data-value="0.3">25%</div>
+        <div class="smooth-option" data-value="0.5">50%</div>
+        <div class="smooth-option" data-value="0.7">75%</div>
+        <div class="smooth-option" data-value="0.9">100%</div>
+    </div>
+</div>
+<div class="zoom-indicator" id="zoomPercent">100%</div>
+
+<script>
+    (function(){
+        // ---------- DOM 元素绑定 ----------
+        const gridCanvas = document.getElementById('c-a');
+        const drawingCanvas = document.getElementById('c-b');
+        const gridCtx = gridCanvas.getContext('2d');
+        const drawCtx = drawingCanvas.getContext('2d');
+        const customCursor = document.getElementById('customCursor');
+        const pencilBtn = document.getElementById('pencilBtn');
+        const eraserBtn = document.getElementById('eraserBtn');
+        const lassoBtn = document.getElementById('lassoBtn');
+        const pinBtn = document.getElementById('pinBtn');
+        const brushPanelEl = document.getElementById('brushPanel');
+        const brushSlider = document.getElementById('brushSizeSlider');
+        const brushValue = document.getElementById('brushSizeValue');
+        const brushLabel = document.getElementById('brushLabel');
+        const smoothTrigger = document.getElementById('smoothTrigger');
+        const smoothDropdown = document.getElementById('smoothDropdown');
+        const zoomSpan = document.getElementById('zoomPercent');
+        const saveBtn = document.getElementById('saveBtn');
+        const importBtn = document.getElementById('importBtn');
+        const fileInput = document.getElementById('fileInput');
+        const pinListContainer = document.getElementById('pinListContainer');
+        const pinEditPanel = document.getElementById('pinEditPanel');
+        
+        // ---------- 全局变量 ----------
+        let strokes = [];
+        let pins = [];
+        let nextPinId = 1;
+        let currentStroke = null, currentTool = '';
+        let pencilWorldWidth = 4, eraserWorldWidth = 12;
+        let smoothFactor = 0.5;
+        const MIN_SCALE = 0.5, MAX_SCALE = 1.5;
+        let scale = 1.0, offsetX = 0, offsetY = 0, canvasWidth = window.innerWidth, canvasHeight = window.innerHeight;
+        let offscreenCanvas = null, offscreenCtx = null;
+        let isDrawing = false, isPanning = false, spacePressed = false, lastPanX = 0, lastPanY = 0, activePointerId = null;
+        let lastMouseScreenX = 0, lastMouseScreenY = 0, lastSmoothPoint = null;
+        let isLassoDrawing = false, lassoPoints = [];
+        
+        let selectedItems = new Set();
+        const PIN_RADIUS_WORLD = 28;
+        let selectionLocalBounds = { x:0,y:0,w:0,h:0 }, selectionCenter = { x:0,y:0 }, selectionRotation = 0;
+        let isTransforming = false, transformType = null, transformStartMouseScreen = null, transformStartStrokesSnapshot = null, transformStartPinsSnapshot = null;
+        let transformStartLocalBounds = null, transformStartCenter = null, transformStartRotation = 0, transformStartCornerIdx = 0, transformStartEdgeIdx = 0;
+        const BORDER_WORLD_WIDTH = 1.5;
+        const CONTROL_POINT_WORLD_SIZE = 6;
+        const ROTATE_HANDLE_WORLD_SIZE = 17;
+        const ROTATE_ICON_WORLD_SIZE = 24;
+        let lassoModifier = 'replace';
+        const PENCIL_COLOR = '#1e293b';
+        const GRID_WORLD_WIDTH = 0.6;
+        
+        let currentEditingPinId = null;
+        let justOpenedPanel = false;
+        let currentLevelMenu = null;
+        let isNameModalActive = false;
+        let modalMask = null;
+        let modalPanel = null;
+        
+        let historyStack = [], historyIndex = -1;
+        function captureState() { return { strokes: JSON.parse(JSON.stringify(strokes)), pins: JSON.parse(JSON.stringify(pins)) }; }
+        function commitHistory() {
+            historyStack = historyStack.slice(0, historyIndex+1);
+            historyStack.push(captureState());
+            historyIndex = historyStack.length-1;
+            updatePinsListUI();
+        }
+        function undo() { if(historyIndex<=0) return; historyIndex--; const state = historyStack[historyIndex]; strokes = JSON.parse(JSON.stringify(state.strokes)); pins = JSON.parse(JSON.stringify(state.pins)); clearSelection(); rebuildOffscreenCache(); renderDrawing(); updatePinsListUI(); closeEditPanel(); }
+        function redo() { if(historyIndex>=historyStack.length-1) return; historyIndex++; const state = historyStack[historyIndex]; strokes = JSON.parse(JSON.stringify(state.strokes)); pins = JSON.parse(JSON.stringify(state.pins)); clearSelection(); rebuildOffscreenCache(); renderDrawing(); updatePinsListUI(); closeEditPanel(); }
+        
+        // 辅助几何函数 (橡皮擦碰撞相关)
+        function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+            const ax = px - x1, ay = py - y1;
+            const bx = x2 - x1, by = y2 - y1;
+            const dot = ax * bx + ay * by;
+            const len2 = bx * bx + by * by;
+            if(len2 === 0) return Math.hypot(ax, ay);
+            let t = dot / len2;
+            t = Math.max(0, Math.min(1, t));
+            const projX = x1 + t * bx;
+            const projY = y1 + t * by;
+            return Math.hypot(px - projX, py - projY);
+        }
+        function eraserCircleHitsStrokeSegment(cx, cy, rEraser, x1, y1, x2, y2, strokeRadius) {
+            const dist = pointToSegmentDistance(cx, cy, x1, y1, x2, y2);
+            return dist <= rEraser + strokeRadius;
+        }
+        function deleteStrokesIntersectingEraser(eraserStroke) {
+            if(!eraserStroke || eraserStroke.points.length < 2) return false;
+            const eraserRadius = eraserStroke.worldWidth / 2;
+            const toDeleteIndices = new Set();
+            for(let i = 0; i < strokes.length; i++) {
+                const st = strokes[i];
+                if(st.type !== 'pencil') continue;
+                const strokeRadius = st.worldWidth / 2;
+                let hit = false;
+                const points = st.points;
+                if(points.length < 2) continue;
+                for(let j = 0; j < eraserStroke.points.length && !hit; j++) {
+                    const ec = eraserStroke.points[j];
+                    for(let k = 0; k < points.length - 1 && !hit; k++) {
+                        const p1 = points[k], p2 = points[k+1];
+                        if(eraserCircleHitsStrokeSegment(ec.x, ec.y, eraserRadius, p1.x, p1.y, p2.x, p2.y, strokeRadius)) { hit = true; break; }
+                    }
+                    if(!hit) {
+                        for(let k = 0; k < points.length && !hit; k++) {
+                            const p = points[k];
+                            if(Math.hypot(ec.x - p.x, ec.y - p.y) <= eraserRadius + strokeRadius) hit = true;
+                        }
+                    }
+                }
+                if(hit) toDeleteIndices.add(i);
+            }
+            if(toDeleteIndices.size === 0) return false;
+            const newStrokes = [];
+            for(let i = 0; i < strokes.length; i++) if(!toDeleteIndices.has(i)) newStrokes.push(strokes[i]);
+            strokes = newStrokes;
+            for(let idx of toDeleteIndices) if(selectedItems.has('s'+idx)) selectedItems.delete('s'+idx);
+            if(selectedItems.size === 0) { selectionLocalBounds = {x:0,y:0,w:0,h:0}; selectionRotation = 0; } else { recomputeSelectionBounds(); }
+            return true;
+        }
+        function finalizeCurrentStroke(){
+            if(!currentStroke) return;
+            if(currentStroke.type === 'eraser') {
+                const hadDeletion = deleteStrokesIntersectingEraser(currentStroke);
+                currentStroke = null; lastSmoothPoint = null; isDrawing = false;
+                rebuildOffscreenCache(); renderDrawing();
+                if(hadDeletion) commitHistory();
+                updateCursorVisibility();
+                return;
+            }
+            if(currentStroke.points.length >= 2){
+                strokes.push({type:currentStroke.type, points:[...currentStroke.points], worldWidth:currentStroke.worldWidth});
+                drawSingleStrokeToContext(offscreenCtx, currentStroke);
+                commitHistory();
+            }
+            currentStroke = null; lastSmoothPoint = null; isDrawing = false;
+            renderDrawing();
+            updateCursorVisibility();
+        }
+        function recomputeSelectionBounds() { if(selectedItems.size===0){ selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionCenter={x:0,y:0}; return; } let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity; for(let item of selectedItems){ if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y;} } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ const r=PIN_RADIUS_WORLD; minX=Math.min(minX,pin.x-r); minY=Math.min(minY,pin.y-r); maxX=Math.max(maxX,pin.x+r); maxY=Math.max(maxY,pin.y+r); } } } selectionLocalBounds={x:minX,y:minY,w:maxX-minX,h:maxY-minY}; selectionCenter={x:minX+(maxX-minX)/2,y:minY+(maxY-minY)/2}; }
+        function getRotatedCorners() { const cx=selectionCenter.x, cy=selectionCenter.y, halfW=selectionLocalBounds.w/2, halfH=selectionLocalBounds.h/2; const localCorners = [{x:-halfW,y:-halfH},{x: halfW,y:-halfH},{x: halfW,y: halfH},{x:-halfW,y: halfH}]; const cos=Math.cos(selectionRotation), sin=Math.sin(selectionRotation); return localCorners.map(p=>({ x:cx+p.x*cos-p.y*sin, y:cy+p.x*sin+p.y*cos })); }
+        function getEdgeCenterWorld(edgeIdx) { const corners=getRotatedCorners(); const idx1=edgeIdx, idx2=(edgeIdx+1)%4; return { x:(corners[idx1].x+corners[idx2].x)/2, y:(corners[idx1].y+corners[idx2].y)/2 }; }
+        function getRotateHandleWorld() { const topMid=getEdgeCenterWorld(0); const dir={x:topMid.x-selectionCenter.x, y:topMid.y-selectionCenter.y}; const len=Math.hypot(dir.x,dir.y); if(len===0) return topMid; const norm={x:dir.x/len, y:dir.y/len}; const offsetWorld = ROTATE_HANDLE_WORLD_SIZE + 16; return { x:topMid.x+norm.x*offsetWorld, y:topMid.y+norm.y*offsetWorld }; }
+        function drawRotateIcon(ctx, worldSize) { ctx.save(); ctx.scale(worldSize/24,worldSize/24); ctx.translate(-12,-12); ctx.strokeStyle='#fff'; ctx.fillStyle='#fff'; ctx.lineWidth=2; ctx.lineCap='round'; ctx.lineJoin='round'; const p1=new Path2D("M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"); const p2=new Path2D("M3 3v5h5"); const p3=new Path2D("M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"); const p4=new Path2D("M16 16h5v5"); ctx.stroke(p1); ctx.stroke(p2); ctx.stroke(p3); ctx.stroke(p4); ctx.beginPath(); ctx.arc(12,12,1,0,2*Math.PI); ctx.fill(); ctx.restore(); }
+        function drawTransformControls() { if(selectedItems.size===0) return; const corners=getRotatedCorners(); const screenCorners=corners.map(p=>worldToScreen(p.x,p.y)); drawCtx.save(); drawCtx.fillStyle='rgba(59,130,246,0.15)'; drawCtx.strokeStyle='#3b82f6'; drawCtx.lineWidth=BORDER_WORLD_WIDTH*scale; drawCtx.beginPath(); drawCtx.moveTo(screenCorners[0].x,screenCorners[0].y); for(let i=1;i<4;i++) drawCtx.lineTo(screenCorners[i].x,screenCorners[i].y); drawCtx.closePath(); drawCtx.fill(); drawCtx.stroke(); drawCtx.fillStyle='#3b82f6'; for(let pt of screenCorners){ drawCtx.beginPath(); drawCtx.arc(pt.x, pt.y, CONTROL_POINT_WORLD_SIZE*scale, 0, 2*Math.PI); drawCtx.fill(); } const rotHandleWorld=getRotateHandleWorld(); const rotScreen=worldToScreen(rotHandleWorld.x,rotHandleWorld.y); drawCtx.beginPath(); drawCtx.arc(rotScreen.x,rotScreen.y, ROTATE_HANDLE_WORLD_SIZE*scale,0,2*Math.PI); drawCtx.fillStyle='#3b82f6'; drawCtx.fill(); drawCtx.save(); drawCtx.translate(rotScreen.x,rotScreen.y); drawCtx.rotate(selectionRotation); drawRotateIcon(drawCtx, ROTATE_ICON_WORLD_SIZE); drawCtx.restore(); drawCtx.restore(); }
+        function hitTestTransformControls(screenX, screenY) { return null; }
+        function applyMove(dx,dy){ for(let item of selectedItems) { if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ p.x+=dx; p.y+=dy; } } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ pin.x+=dx; pin.y+=dy; } } } selectionLocalBounds.x+=dx; selectionLocalBounds.y+=dy; selectionCenter.x+=dx; selectionCenter.y+=dy; }
+        function applyRotate(delta){ const cos=Math.cos(delta), sin=Math.sin(delta), cx=selectionCenter.x, cy=selectionCenter.y; for(let item of selectedItems){ if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ const dx=p.x-cx, dy=p.y-cy; p.x=cx+dx*cos-dy*sin; p.y=cy+dx*sin+dy*cos; } } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ const dx=pin.x-cx, dy=pin.y-cy; pin.x=cx+dx*cos-dy*sin; pin.y=cy+dx*sin+dy*cos; } } } selectionRotation+=delta; selectionRotation=((selectionRotation%(2*Math.PI))+2*Math.PI)%(2*Math.PI); }
+        function applyCornerScale(fixed,factor){ for(let item of selectedItems){ if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ p.x=fixed.x+(p.x-fixed.x)*factor; p.y=fixed.y+(p.y-fixed.y)*factor; } } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ pin.x=fixed.x+(pin.x-fixed.x)*factor; pin.y=fixed.y+(pin.y-fixed.y)*factor; } } } recomputeSelectionBounds(); }
+        function applyEdgeScale(fixed,axis,factor){ for(let item of selectedItems){ if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ const dx=p.x-fixed.x, dy=p.y-fixed.y; const dot=dx*axis.x+dy*axis.y; const perpX=dx-dot*axis.x, perpY=dy-dot*axis.y; const newDot=dot*factor; p.x=fixed.x+newDot*axis.x+perpX; p.y=fixed.y+newDot*axis.y+perpY; } } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ const dx=pin.x-fixed.x, dy=pin.y-fixed.y; const dot=dx*axis.x+dy*axis.y; const perpX=dx-dot*axis.x, perpY=dy-dot*axis.y; const newDot=dot*factor; pin.x=fixed.x+newDot*axis.x+perpX; pin.y=fixed.y+newDot*axis.y+perpY; } } } recomputeSelectionBounds(); }
+        function startTransform(type, sx, sy, idx=0){ isTransforming=true; transformType=type; transformStartMouseScreen={x:sx,y:sy}; transformStartStrokesSnapshot=JSON.parse(JSON.stringify(strokes)); transformStartPinsSnapshot=JSON.parse(JSON.stringify(pins)); transformStartLocalBounds={...selectionLocalBounds}; transformStartCenter={...selectionCenter}; transformStartRotation=selectionRotation; if(type==='corner') transformStartCornerIdx=idx; if(type==='edge') transformStartEdgeIdx=idx; }
+        function onTransformMove(sx,sy){ if(!isTransforming) return; strokes=JSON.parse(JSON.stringify(transformStartStrokesSnapshot)); pins=JSON.parse(JSON.stringify(transformStartPinsSnapshot)); selectionLocalBounds={...transformStartLocalBounds}; selectionCenter={...transformStartCenter}; selectionRotation=transformStartRotation; if(transformType==='move'){ const dx=(sx-transformStartMouseScreen.x)/scale, dy=(sy-transformStartMouseScreen.y)/scale; applyMove(dx,dy); } else if(transformType==='rotate'){ const cs=worldToScreen(selectionCenter.x,selectionCenter.y); const sa=Math.atan2(transformStartMouseScreen.y-cs.y, transformStartMouseScreen.x-cs.x); const ca=Math.atan2(sy-cs.y, sx-cs.x); applyRotate(ca-sa); } else if(transformType==='corner'){ const corners=getRotatedCorners(); const fixed=corners[(transformStartCornerIdx+2)%4]; const startMouse=screenToWorld(transformStartMouseScreen.x,transformStartMouseScreen.y); const curMouse=screenToWorld(sx,sy); const vecStart={x:corners[transformStartCornerIdx].x-fixed.x, y:corners[transformStartCornerIdx].y-fixed.y}; const vecCur={x:curMouse.x-fixed.x, y:curMouse.y-fixed.y}; const startLen=Math.hypot(vecStart.x,vecStart.y); const curLen=Math.hypot(vecCur.x,vecCur.y); const factor=startLen>0?curLen/startLen:1; applyCornerScale(fixed,factor); } else if(transformType==='edge'){ const movingEdge=getEdgeCenterWorld(transformStartEdgeIdx); const fixedEdge=getEdgeCenterWorld((transformStartEdgeIdx+2)%4); const axis={x:movingEdge.x-fixedEdge.x, y:movingEdge.y-fixedEdge.y}; const len=Math.hypot(axis.x,axis.y); if(len>0){ axis.x/=len; axis.y/=len; } const startMouse=screenToWorld(transformStartMouseScreen.x,transformStartMouseScreen.y); const curMouse=screenToWorld(sx,sy); const startProj=(startMouse.x-fixedEdge.x)*axis.x+(startMouse.y-fixedEdge.y)*axis.y; const curProj=(curMouse.x-fixedEdge.x)*axis.x+(curMouse.y-fixedEdge.y)*axis.y; const factor=startProj!==0?curProj/startProj:1; applyEdgeScale(fixedEdge,axis,factor); } rebuildOffscreenCache(); renderDrawing(); updatePinsListUI(); }
+        function endTransform(){ if(isTransforming){ commitHistory(); isTransforming=false; transformType=null; updatePinsListUI(); } }
+        function pointInPolygon(px,py,poly){ let inside=false; for(let i=0,j=poly.length-1;i<poly.length;j=i++){ const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y; const intersect=((yi>py)!=(yj>py)) && (px<(xj-xi)*(py-yi)/(yj-yi)+xi); if(intersect) inside=!inside; } return inside; }
+        function isStrokeSelected(stroke, poly){ for(let p of stroke.points) if(pointInPolygon(p.x,p.y,poly)) return true; return false; }
+        function isPinSelected(pin, poly){ return pointInPolygon(pin.x,pin.y,poly); }
+        function getSelectedItemsInsidePolygon(poly){ const items=[]; for(let i=0;i<strokes.length;i++) if(isStrokeSelected(strokes[i],poly)) items.push('s'+i); for(let i=0;i<pins.length;i++) if(isPinSelected(pins[i],poly)) items.push('p'+i); return items; }
+        function updateSelectionWithModifier(newItems, mod){ if(mod==='add') for(let it of newItems) selectedItems.add(it); else if(mod==='subtract') for(let it of newItems) selectedItems.delete(it); else { selectedItems.clear(); for(let it of newItems) selectedItems.add(it); } if(selectedItems.size===0){ selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionRotation=0; } else { recomputeSelectionBounds(); selectionRotation=0; } renderDrawing(); }
+        function clearSelection(){ selectedItems.clear(); selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionRotation=0; renderDrawing(); }
+        function deleteSelected(){ if(selectedItems.size===0) return; const newStrokes=[]; const newPins=[]; for(let i=0;i<strokes.length;i++) if(!selectedItems.has('s'+i)) newStrokes.push(strokes[i]); for(let i=0;i<pins.length;i++) if(!selectedItems.has('p'+i)) newPins.push(pins[i]); strokes=newStrokes; pins=newPins; clearSelection(); rebuildOffscreenCache(); renderDrawing(); commitHistory(); updatePinsListUI(); closeEditPanel(); }
+        function drawLassoSelection(){ if(!isLassoDrawing||lassoPoints.length<2) return; drawCtx.save(); drawCtx.beginPath(); const first=worldToScreen(lassoPoints[0].x,lassoPoints[0].y); drawCtx.moveTo(first.x,first.y); for(let i=1;i<lassoPoints.length;i++){ const p=worldToScreen(lassoPoints[i].x,lassoPoints[i].y); drawCtx.lineTo(p.x,p.y); } drawCtx.closePath(); drawCtx.fillStyle='rgba(59,130,246,0.2)'; drawCtx.fill(); drawCtx.strokeStyle='#3b82f6'; drawCtx.lineWidth=2; drawCtx.setLineDash([6,6]); drawCtx.stroke(); drawCtx.setLineDash([]); drawCtx.restore(); }
+        function drawSelectedHighlights(){ if(selectedItems.size===0) return; drawCtx.save(); for(let item of selectedItems){ if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke&&stroke.points.length>=2){ drawCtx.beginPath(); const first=worldToScreen(stroke.points[0].x,stroke.points[0].y); drawCtx.moveTo(first.x,first.y); for(let i=1;i<stroke.points.length;i++){ const p=worldToScreen(stroke.points[i].x,stroke.points[i].y); drawCtx.lineTo(p.x,p.y); } drawCtx.lineWidth=stroke.worldWidth*scale; drawCtx.strokeStyle='#3b82f6'; drawCtx.stroke(); } } else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ const cs=worldToScreen(pin.x,pin.y); drawCtx.beginPath(); drawCtx.arc(cs.x,cs.y,PIN_RADIUS_WORLD*scale,0,2*Math.PI); drawCtx.lineWidth=3*scale; drawCtx.strokeStyle='#3b82f6'; drawCtx.stroke(); } } } drawCtx.restore(); }
+        function renderDrawing(){ drawCtx.clearRect(0,0,canvasWidth,canvasHeight); if(offscreenCanvas) drawCtx.drawImage(offscreenCanvas,0,0); drawCurrentStrokeToMain(); for(let pin of pins){ drawPin(drawCtx, pin); } drawLassoSelection(); drawSelectedHighlights(); drawTransformControls(); }
+        function drawPin(ctx, pin){ 
+            const centerScreen = worldToScreen(pin.x, pin.y);
+            const radiusScreen = PIN_RADIUS_WORLD * scale;
+            ctx.save();
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = "rgba(0,0,0,0.4)";
+            ctx.beginPath();
+            ctx.arc(centerScreen.x, centerScreen.y, radiusScreen, 0, 2 * Math.PI);
+            // 互动中的图钉显示为蓝色，否则为黄色
+            if (currentEditingPinId === pin.id) {
+                ctx.fillStyle = "#3b82f6";   // 蓝色高亮
+            } else {
+                ctx.fillStyle = "#f1c40f";   // 默认金色
+            }
+            ctx.fill();
+            ctx.restore();
+        }
+        function drawSingleStrokeToContext(ctx,stroke){ if(!stroke.points||stroke.points.length<2) return; ctx.save(); ctx.beginPath(); ctx.lineCap='round'; ctx.lineJoin='round'; ctx.lineWidth=stroke.worldWidth*scale; if(stroke.type==='pencil'){ ctx.globalCompositeOperation='source-over'; ctx.strokeStyle=PENCIL_COLOR; }else{ ctx.globalCompositeOperation='source-over'; ctx.strokeStyle='rgba(100,116,139,0.4)'; ctx.setLineDash([8,6]); } const first=stroke.points[0]; const fs=worldToScreen(first.x,first.y); ctx.moveTo(fs.x,fs.y); for(let i=1;i<stroke.points.length;i++){ const p=stroke.points[i]; const sp=worldToScreen(p.x,p.y); ctx.lineTo(sp.x,sp.y); } ctx.stroke(); ctx.setLineDash([]); ctx.restore(); }
+        function rebuildOffscreenCache(){ if(!offscreenCtx) return; offscreenCtx.clearRect(0,0,canvasWidth,canvasHeight); for(const stroke of strokes) if(stroke.type === 'pencil') drawSingleStrokeToContext(offscreenCtx,stroke); }
+        function drawCurrentStrokeToMain(){ if(currentStroke&&currentStroke.points.length>=2) drawSingleStrokeToContext(drawCtx,currentStroke); }
+        function fullRender(){ renderGrid(); if(offscreenCanvas) rebuildOffscreenCache(); renderDrawing(); }
+        function renderGrid(){ gridCtx.clearRect(0,0,canvasWidth,canvasHeight); gridCtx.fillStyle='#f8f9fc'; gridCtx.fillRect(0,0,canvasWidth,canvasHeight); const topLeft=screenToWorld(0,0); const bottomRight=screenToWorld(canvasWidth,canvasHeight); const startX=Math.floor(topLeft.x/50)*50; const startY=Math.floor(topLeft.y/50)*50; const endX=bottomRight.x+50, endY=bottomRight.y+50; gridCtx.save(); gridCtx.strokeStyle='#d4dcec'; gridCtx.lineWidth=GRID_WORLD_WIDTH*scale; gridCtx.globalAlpha=0.7; for(let x=startX;x<=endX;x+=50){ const from=worldToScreen(x,topLeft.y); const to=worldToScreen(x,bottomRight.y); gridCtx.beginPath(); gridCtx.moveTo(from.x,from.y); gridCtx.lineTo(to.x,to.y); gridCtx.stroke(); } for(let y=startY;y<=endY;y+=50){ const from=worldToScreen(topLeft.x,y); const to=worldToScreen(bottomRight.x,y); gridCtx.beginPath(); gridCtx.moveTo(from.x,from.y); gridCtx.lineTo(to.x,to.y); gridCtx.stroke(); } gridCtx.restore(); }
+        
+        function focusOnPin(worldX, worldY) { const targetScreenX=canvasWidth/2; const targetScreenY=canvasHeight/2; offsetX=worldX-targetScreenX/scale; offsetY=worldY-targetScreenY/scale; fullRender(); updateZoomDisplay(); }
+        function getPinByWorldClick(worldX, worldY) { for(let i=0;i<pins.length;i++){ if(Math.hypot(pins[i].x-worldX, pins[i].y-worldY)<=PIN_RADIUS_WORLD) return {idx:i, pin:pins[i]}; } return null; }
+        
+        // 模态命名弹窗 (屏幕居中)
+        function showModalRename(pin) {
+            if (isNameModalActive) return;
+            isNameModalActive = true;
+            const mask = document.createElement('div');
+            mask.className = 'modal-mask';
+            document.body.appendChild(mask);
+            modalMask = mask;
+            const panel = document.createElement('div');
+            panel.className = 'pin-name-modal';
+            panel.innerHTML = `<input type="text" id="modalRenameInput" value="${escapeHtml(pin.name)}" maxlength="40" autocomplete="off" placeholder="输入图钉名称">`;
+            document.body.appendChild(panel);
+            modalPanel = panel;
+            const input = panel.querySelector('#modalRenameInput');
+            input.focus();
+            input.select();
+            
+            const closeModal = (save) => {
+                if (!isNameModalActive) return;
+                if (save) {
+                    const newName = input.value.trim();
+                    if (newName !== "") {
+                        pin.name = newName;
+                        updatePinsListUI();
+                        commitHistory();
+                        renderDrawing();
+                    }
+                }
+                mask.remove();
+                panel.remove();
+                modalMask = null;
+                modalPanel = null;
+                isNameModalActive = false;
+            };
+            mask.onclick = () => closeModal(true);
+            input.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    e.stopPropagation();
+                    closeModal(true);
+                }
+            });
+            const escHandler = (e) => {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeModal(false);
+                    document.removeEventListener('keydown', escHandler);
+                }
+            };
+            document.addEventListener('keydown', escHandler);
+            panel.addEventListener('click', (e) => e.stopPropagation());
+        }
+        
+        // 三按钮面板操作 — 固定在底部，不再跟随坐标
+        function openEditPanel(pinId) {
+            const pin = pins.find(p=>p.id===pinId);
+            if(!pin) return;
+            if (isNameModalActive) return;
+            currentEditingPinId = pinId;
+            pinEditPanel.innerHTML = `
+                <button class="pin-action-btn" id="pinRenameBtn">✏️</button>
+                <button class="pin-action-btn" id="pinLevelBtn">📊</button>
+                <button class="pin-action-btn delete-btn" id="pinDeleteBtn">🗑️</button>
+            `;
+            pinEditPanel.classList.add('show');
+            justOpenedPanel = true;
+            setTimeout(()=>{ justOpenedPanel = false; }, 200);
+            
+            const renameBtn = document.getElementById('pinRenameBtn');
+            const levelBtn = document.getElementById('pinLevelBtn');
+            const deleteBtn = document.getElementById('pinDeleteBtn');
+            if(renameBtn) renameBtn.onclick = (e) => { e.stopPropagation(); showModalRename(pin); closeEditPanel(); };
+            if(levelBtn) levelBtn.onclick = (e) => { e.stopPropagation(); showLevelMenu(levelBtn, pinId); };
+            if(deleteBtn) deleteBtn.onclick = (e) => { e.stopPropagation(); deleteCurrentPinAndClose(); };
+            renderDrawing(); // 立即重绘以显示蓝色高亮
+        }
+        function showLevelMenu(btn, pinId) {
+            if(currentLevelMenu) currentLevelMenu.remove();
+            const menu = document.createElement('div');
+            menu.className = 'level-menu';
+            const levels = [
+                { name: "一级", value: 0 },
+                { name: "二级", value: 1 },
+                { name: "三级", value: 2 }
+            ];
+            levels.forEach(lv => {
+                const opt = document.createElement('div');
+                opt.className = 'level-option';
+                opt.textContent = lv.name;
+                opt.onclick = (e) => {
+                    e.stopPropagation();
+                    const pin = pins.find(p=>p.id===pinId);
+                    if(pin) {
+                        pin.level = lv.value;
+                        updatePinsListUI();
+                        commitHistory();
+                        renderDrawing();
+                    }
+                    menu.remove();
+                    if(currentLevelMenu === menu) currentLevelMenu = null;
+                };
+                menu.appendChild(opt);
+            });
+            const rect = btn.getBoundingClientRect();
+            menu.style.left = `${rect.left}px`;
+            menu.style.top = `${rect.bottom + 4}px`;
+            document.body.appendChild(menu);
+            currentLevelMenu = menu;
+            const closeMenu = (e) => { if(menu && !menu.contains(e.target)) { menu.remove(); if(currentLevelMenu===menu) currentLevelMenu=null; document.removeEventListener('click', closeMenu); } };
+            setTimeout(()=> document.addEventListener('click', closeMenu), 10);
+        }
+        function deleteCurrentPinAndClose() {
+            if(currentEditingPinId===null) return;
+            const idx = pins.findIndex(p=>p.id===currentEditingPinId);
+            if(idx!==-1) {
+                pins.splice(idx,1);
+                closeEditPanel();
+                clearSelection();
+                rebuildOffscreenCache();
+                renderDrawing();
+                commitHistory();
+                updatePinsListUI();
+            }
+        }
+        function closeEditPanel() { 
+            pinEditPanel.classList.remove('show'); 
+            if(currentLevelMenu) { currentLevelMenu.remove(); currentLevelMenu=null; } 
+            currentEditingPinId=null; 
+            renderDrawing(); // 重绘恢复图钉颜色
+        }
+        function placePin(worldX, worldY){ const newId = nextPinId++; const defaultName = `图钉${newId}`; pins.push({ id: newId, x: worldX, y: worldY, name: defaultName, level: 0 }); rebuildOffscreenCache(); renderDrawing(); commitHistory(); updatePinsListUI(); }
+        function updatePinsListUI() { if(!pinListContainer) return; pinListContainer.innerHTML = ''; if(pins.length === 0) { pinListContainer.innerHTML = '<div class="empty-pins">暂无图钉<br>点击 📌 放置图钉</div>'; return; } const sorted = [...pins]; sorted.forEach(pin => { const itemDiv = document.createElement('div'); itemDiv.className = 'pin-item'; const infoSpan = document.createElement('div'); infoSpan.className = 'pin-info'; const levelIndent = pin.level * 16; infoSpan.style.paddingLeft = `${levelIndent}px`; const levelBadge = pin.level===0?'一级':(pin.level===1?'二级':'三级'); infoSpan.innerHTML = `<span class="pin-icon">📌</span><span class="pin-name" title="${escapeHtml(pin.name)}">${escapeHtml(pin.name)}</span><span class="pin-level-badge">${levelBadge}</span>`; itemDiv.appendChild(infoSpan); itemDiv.addEventListener('click', (e) => { e.stopPropagation(); focusOnPin(pin.x, pin.y); }); pinListContainer.appendChild(itemDiv); }); }
+        function escapeHtml(str) { return str.replace(/[&<>]/g, function(m){ if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
+        
+        // 插值与平滑
+        function interpolatePoints(p1,p2,stepScreen=1.5){ const screenP1=worldToScreen(p1.x,p1.y), screenP2=worldToScreen(p2.x,p2.y); const dist=Math.hypot(screenP2.x-screenP1.x,screenP2.y-screenP1.y); if(dist<stepScreen) return [p2]; const steps=Math.ceil(dist/stepScreen); const res=[]; for(let i=1;i<=steps;i++){ const t=i/steps; res.push({x:p1.x+(p2.x-p1.x)*t,y:p1.y+(p2.y-p1.y)*t}); } return res; }
+        function applySmoothing(raw){ if(smoothFactor===0||lastSmoothPoint===null) return raw; const alpha=smoothFactor; return {x:lastSmoothPoint.x*(1-alpha)+raw.x*alpha, y:lastSmoothPoint.y*(1-alpha)+raw.y*alpha}; }
+        function addPointWithSmoothingAndInterp(rawX,rawY){ if(!currentStroke) return; const raw={x:rawX,y:rawY}; const smooth=applySmoothing(raw); lastSmoothPoint={x:smooth.x,y:smooth.y}; const last=currentStroke.points[currentStroke.points.length-1]; const interp=interpolatePoints(last,smooth,1.5); for(let pt of interp) currentStroke.points.push(pt); renderDrawing(); }
+        function startStroke(worldX,worldY,toolType,width){ lastSmoothPoint=null; lastSmoothPoint={x:worldX,y:worldY}; currentStroke={type:toolType,points:[{x:worldX,y:worldY}],worldWidth:width}; isDrawing=true; renderDrawing(); drawingCanvas.style.cursor='none'; updateCursorVisibility(); }
+        function startLasso(worldX,worldY,modifier){ lassoModifier=modifier; if(modifier==='replace') clearSelection(); isLassoDrawing=true; lassoPoints=[{x:worldX,y:worldY}]; renderDrawing(); updateCursorVisibility(); }
+        function addLassoPoint(worldX,worldY){ if(!isLassoDrawing) return; lassoPoints.push({x:worldX,y:worldY}); renderDrawing(); }
+        function finalizeLasso(){ if(lassoPoints.length<3){ isLassoDrawing=false; lassoPoints=[]; renderDrawing(); return; } const inside = getSelectedItemsInsidePolygon(lassoPoints); updateSelectionWithModifier(inside, lassoModifier); isLassoDrawing=false; lassoPoints=[]; renderDrawing(); }
+        
+        function screenToWorld(sx,sy){ return {x:offsetX+sx/scale, y:offsetY+sy/scale}; }
+        function worldToScreen(wx,wy){ return {x:(wx-offsetX)*scale, y:(wy-offsetY)*scale}; }
+        function getCurrentWorldWidth(){ return currentTool==='pencil'?pencilWorldWidth:(currentTool==='eraser'?eraserWorldWidth:4); }
+        function updateBrushPanelUI(){ if(currentTool==='pencil'){ brushLabel.textContent='笔刷粗细'; brushSlider.value=pencilWorldWidth; brushValue.textContent=pencilWorldWidth; brushPanelEl.classList.remove('show'); } else if(currentTool==='eraser'){ brushLabel.textContent='橡皮粗细'; brushSlider.value=eraserWorldWidth; brushValue.textContent=eraserWorldWidth; brushPanelEl.classList.remove('show'); } else{ brushPanelEl.classList.remove('show'); } }
+        function setCurrentWorldWidthFromSlider(v){ const w=parseInt(v,10); if(currentTool==='pencil') pencilWorldWidth=w; else if(currentTool==='eraser') eraserWorldWidth=w; brushSlider.value=w; brushValue.textContent=w; updateCursorSize(); }
+        function showBrushPanelRelativeToButton(btn){ if(!btn) return; const toolbarRect = document.querySelector('.toolbar').getBoundingClientRect(); const btnRect = btn.getBoundingClientRect(); let leftPos = toolbarRect.right + 12; brushPanelEl.style.left = leftPos + 'px'; brushPanelEl.style.top = (btnRect.top + btnRect.height/2) + 'px'; brushPanelEl.style.transform = 'translateY(-50%)'; brushPanelEl.classList.add('show'); }
+        function setTool(tool,showPanel=false,srcBtn=null){ if(tool===currentTool&&!showPanel) return; if (isNameModalActive) return; clearSelection(); if(isLassoDrawing){ isLassoDrawing=false; lassoPoints=[]; renderDrawing(); } closeEditPanel(); currentTool=tool; pencilBtn.classList.remove('active'); eraserBtn.classList.remove('active'); lassoBtn.classList.remove('active'); pinBtn.classList.remove('active','pin-active'); customCursor.classList.remove('pencil-mode','eraser-mode','lasso-mode','pin-mode'); if(tool==='pencil'){ pencilBtn.classList.add('active'); customCursor.classList.add('pencil-mode'); } else if(tool==='eraser'){ eraserBtn.classList.add('active'); customCursor.classList.add('eraser-mode'); } else if(tool==='lasso'){ lassoBtn.classList.add('active'); customCursor.classList.add('lasso-mode'); } else if(tool==='pin'){ pinBtn.classList.add('active','pin-active'); customCursor.classList.add('pin-mode'); } updateBrushPanelUI(); if(showPanel&&(tool==='pencil'||tool==='eraser')){ const btn=srcBtn||(tool==='pencil'?pencilBtn:eraserBtn); showBrushPanelRelativeToButton(btn); } else{ brushPanelEl.classList.remove('show'); } updateCursorSize(); if(!isPanning&&!isDrawing&&!isLassoDrawing) updateCursorVisibility(); }
+        function hideBrushPanel(){ brushPanelEl.classList.remove('show'); }
+        function updateZoomDisplay(){ zoomSpan.textContent=`${Math.round(scale*100)}%`; }
+        function initOffscreenCanvas(){ offscreenCanvas=document.createElement('canvas'); offscreenCanvas.width=canvasWidth; offscreenCanvas.height=canvasHeight; offscreenCtx=offscreenCanvas.getContext('2d'); }
+        function resizeOffscreenCanvas(){ if(!offscreenCanvas) initOffscreenCanvas(); else{ offscreenCanvas.width=canvasWidth; offscreenCanvas.height=canvasHeight; } }
+        function panView(dx,dy){ offsetX-=dx/scale; offsetY-=dy/scale; fullRender(); updateZoomDisplay(); updateCursorSize(); }
+        function zoomAtScreen(sx,sy,delta){ let ns=scale*delta; ns=Math.min(Math.max(ns,MIN_SCALE),MAX_SCALE); if(ns===scale) return; const before=screenToWorld(sx,sy); scale=ns; offsetX=before.x-sx/scale; offsetY=before.y-sy/scale; fullRender(); updateZoomDisplay(); updateCursorSize(); }
+        function maintainCenterOnResize(){ const prev=screenToWorld(canvasWidth/2,canvasHeight/2); canvasWidth=window.innerWidth; canvasHeight=window.innerHeight; gridCanvas.width=canvasWidth; gridCanvas.height=canvasHeight; drawingCanvas.width=canvasWidth; drawingCanvas.height=canvasHeight; resizeOffscreenCanvas(); const newCenter={x:canvasWidth/2, y:canvasHeight/2}; offsetX=prev.x-newCenter.x/scale; offsetY=prev.y-newCenter.y/scale; fullRender(); }
+        function updateCursorSize(){ if(currentTool==='lasso'){ customCursor.style.width='24px'; customCursor.style.height='24px'; return; } if(currentTool==='pin'){ customCursor.style.width='28px'; customCursor.style.height='28px'; return; } const w=getCurrentWorldWidth(); const d=Math.max(8,w*scale); customCursor.style.width=`${d}px`; customCursor.style.height=`${d}px`; }
+        function saveCanvas(){ const saveStrokes = strokes.filter(s => s.type === 'pencil'); const data={version:"1.1",view:{offsetX,offsetY,scale},strokes:saveStrokes.map(s=>({type:s.type,worldWidth:s.worldWidth,points:s.points.map(p=>({x:p.x,y:p.y}))})), pins:pins.map(p=>({id:p.id,x:p.x,y:p.y,name:p.name,level:p.level}))}; const json=JSON.stringify(data,null,2); const blob=new Blob([json],{type:"application/json"}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`canvas_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.infcanvas`; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }
+        function importCanvas(file){ const reader=new FileReader(); reader.onload=e=>{ try{ const data=JSON.parse(e.target.result); if(data.strokes && Array.isArray(data.strokes)) strokes=data.strokes.filter(s=>s.type==='pencil').map(s=>({type:'pencil',worldWidth:s.worldWidth,points:s.points.map(p=>({x:p.x,y:p.y}))})); else strokes=[]; if(data.pins && Array.isArray(data.pins)) pins=data.pins.map(p=>({id:p.id??(nextPinId++),x:p.x,y:p.y,name:p.name??`图钉${p.id}`,level:p.level??0})); else pins=[]; if(data.view){ offsetX=data.view.offsetX??offsetX; offsetY=data.view.offsetY??offsetY; let ns=data.view.scale??scale; ns=Math.min(Math.max(ns,MIN_SCALE),MAX_SCALE); scale=ns; } if(currentStroke){ currentStroke=null; isDrawing=false; lastSmoothPoint=null; } clearSelection(); resizeOffscreenCanvas(); fullRender(); updateZoomDisplay(); updateCursorSize(); commitHistory(); updatePinsListUI(); }catch(err){ alert("导入失败"); } }; reader.readAsText(file); }
+        function triggerImport(){ fileInput.click(); }
+        function onFileSelected(e){ const file=e.target.files[0]; if(file) importCanvas(file); fileInput.value=''; }
+        function updateCursorVisibility(){ if(isNameModalActive){ customCursor.style.display='none'; return; } if(isDrawing||isPanning||isLassoDrawing||isTransforming){ customCursor.style.display='block'; return; } const hover=document.elementFromPoint(lastMouseScreenX,lastMouseScreenY); const uiElements=[document.querySelector('.toolbar'), brushPanelEl, document.querySelector('.smooth-container'), document.querySelector('.panel'), pinEditPanel]; let onUI=false; for(let ui of uiElements) if(ui&&ui.contains(hover)){ onUI=true; break; } customCursor.style.display=onUI?'none':'block'; }
+        function moveCursor(sx,sy){ if(isNameModalActive) return; customCursor.style.left=`${sx}px`; customCursor.style.top=`${sy}px`; }
+        function onGlobalMouseMove(e){ lastMouseScreenX=e.clientX; lastMouseScreenY=e.clientY; updateCursorVisibility(); }
+        function updateSmoothUI(){ const p=Math.round(smoothFactor*100); smoothTrigger.textContent=`防抖 ${p}%`; document.querySelectorAll('.smooth-option').forEach(opt=>{ const val=parseFloat(opt.dataset.value); if(Math.abs(val-smoothFactor)<0.01) opt.classList.add('selected'); else opt.classList.remove('selected'); }); }
+        function setSmoothFactor(v){ smoothFactor=v; updateSmoothUI(); smoothDropdown.classList.remove('show'); }
+        function toggleDropdown(e){ e.stopPropagation(); smoothDropdown.classList.toggle('show'); }
+        function onOptionClick(e){ setSmoothFactor(parseFloat(e.currentTarget.dataset.value)); }
+        function closeDropdownOnOutside(e){ if(!smoothDropdown.contains(e.target)&&e.target!==smoothTrigger) smoothDropdown.classList.remove('show'); }
+        function handleDocumentClick(e){ if(brushPanelEl.classList.contains('show')){ const inside=brushPanelEl.contains(e.target); const isPencil=pencilBtn.contains(e.target); const isEraser=eraserBtn.contains(e.target); if(!inside&&!isPencil&&!isEraser) hideBrushPanel(); } if(!pinEditPanel.contains(e.target) && !(currentTool==='pin' && e.target.closest('.pin-item')) && !justOpenedPanel) { closeEditPanel(); } }
+        let pointerDownScreen=null, coordsCache=null;
+        function getCanvasCoordsFromEvent(e,rect){ const x=e.clientX-rect.left, y=e.clientY-rect.top; if(x<0||x>canvasWidth||y<0||y>canvasHeight) return null; return {x,y}; }
+        function onPointerDown(e){
+            if (isNameModalActive) return;
+            e.preventDefault();
+            drawingCanvas.setPointerCapture(e.pointerId);
+            const rect=drawingCanvas.getBoundingClientRect();
+            const coords=getCanvasCoordsFromEvent(e,rect);
+            if(!coords) return;
+            const {x:sx,y:sy}=coords;
+            lastMouseScreenX=sx; lastMouseScreenY=sy;
+            pointerDownScreen={x:sx,y:sy};
+            const world=screenToWorld(sx,sy);
+            if((spacePressed&&e.button===0)||e.button===2){
+                if(isDrawing) finalizeCurrentStroke();
+                if(isLassoDrawing) finalizeLasso();
+                cancelTransform();
+                isPanning=true;
+                activePointerId=e.pointerId;
+                lastPanX=sx; lastPanY=sy;
+                drawingCanvas.style.cursor='grabbing';
+                updateCursorVisibility();
+                return;
+            }
+            if(currentTool==='lasso'){
+                const hit=hitTestTransformControls(sx,sy);
+                if(hit && selectedItems.size>0){ if(hit.type==='move') startTransform('move',sx,sy); else if(hit.type==='corner') startTransform('corner',sx,sy,hit.index); else if(hit.type==='edge') startTransform('edge',sx,sy,hit.index); else if(hit.type==='rotate') startTransform('rotate',sx,sy); activePointerId=e.pointerId; return; }
+                let mod='replace'; if(e.shiftKey) mod='add'; else if(e.altKey) mod='subtract';
+                startLasso(world.x,world.y,mod);
+                activePointerId=e.pointerId;
+                return;
+            }
+            if(currentTool==='pin'){
+                const wasPanelOpen = pinEditPanel.classList.contains('show');
+                let clickedPin = null;
+                clickedPin = getPinByWorldClick(world.x, world.y);
+                if (wasPanelOpen) {
+                    const wasEditingId = currentEditingPinId;
+                    closeEditPanel();
+                    if (clickedPin && clickedPin.pin.id === wasEditingId) {
+                        return;
+                    }
+                }
+                if (clickedPin) {
+                    openEditPanel(clickedPin.pin.id);
+                    return;
+                }
+                if (!wasPanelOpen) {
+                    placePin(world.x, world.y);
+                }
+                return;
+            }
+            if(e.button===0&&!isPanning){
+                if(isDrawing) return;
+                if(isLassoDrawing) finalizeLasso();
+                cancelTransform();
+                startStroke(world.x,world.y,currentTool,getCurrentWorldWidth());
+                activePointerId=e.pointerId;
+            }
+        }
+        function onPointerMove(e){
+            if (isNameModalActive) return;
+            const rect=drawingCanvas.getBoundingClientRect();
+            const coords=getCanvasCoordsFromEvent(e,rect);
+            if(coords){ lastMouseScreenX=coords.x; lastMouseScreenY=coords.y; coordsCache=coords; }
+            if(isPanning&&activePointerId===e.pointerId&&coords){
+                const dx=coords.x-lastPanX, dy=coords.y-lastPanY;
+                if(dx!==0||dy!==0) panView(dx,dy);
+                lastPanX=coords.x; lastPanY=coords.y;
+                if(coords) moveCursor(coords.x,coords.y);
+                return;
+            }
+            if(isTransforming&&activePointerId===e.pointerId&&coords){
+                onTransformMove(coords.x,coords.y);
+                return;
+            }
+            if(coords){ moveCursor(coords.x,coords.y); if(!isDrawing&&!isPanning&&!isLassoDrawing&&!isTransforming) updateCursorVisibility(); }
+            if(isDrawing&&activePointerId===e.pointerId&&currentStroke&&coords){
+                const w=screenToWorld(coords.x,coords.y);
+                addPointWithSmoothingAndInterp(w.x,w.y);
+            }
+            if(isLassoDrawing&&activePointerId===e.pointerId&&coords){
+                const w=screenToWorld(coords.x,coords.y);
+                addLassoPoint(w.x,w.y);
+            }
+        }
+        function onPointerUp(e){
+            if (isNameModalActive) return;
+            e.preventDefault();
+            drawingCanvas.releasePointerCapture(e.pointerId);
+            if(isPanning&&activePointerId===e.pointerId){ isPanning=false; activePointerId=null; drawingCanvas.style.cursor='none'; updateCursorVisibility(); return; }
+            if(isTransforming&&activePointerId===e.pointerId){ endTransform(); activePointerId=null; drawingCanvas.style.cursor='none'; updateCursorVisibility(); return; }
+            if(isDrawing&&activePointerId===e.pointerId){ finalizeCurrentStroke(); activePointerId=null; isDrawing=false; updateCursorVisibility(); return; }
+            if(isLassoDrawing&&activePointerId===e.pointerId){ finalizeLasso(); activePointerId=null; isLassoDrawing=false; updateCursorVisibility(); return; }
+            if(currentTool==='lasso'&&!isLassoDrawing&&!isTransforming&&pointerDownScreen&&coordsCache){
+                const dx=coordsCache.x-pointerDownScreen.x, dy=coordsCache.y-pointerDownScreen.y;
+                if(Math.hypot(dx,dy)<5) clearSelection();
+            }
+            pointerDownScreen=null; coordsCache=null;
+        }
+        function onPointerCancel(e){
+            if (isNameModalActive) return;
+            if(isDrawing&&activePointerId===e.pointerId) finalizeCurrentStroke();
+            if(isLassoDrawing&&activePointerId===e.pointerId) finalizeLasso();
+            if(isPanning&&activePointerId===e.pointerId) isPanning=false;
+            if(isTransforming&&activePointerId===e.pointerId) cancelTransform();
+            activePointerId=null;
+            pointerDownScreen=null; coordsCache=null;
+        }
+        function cancelTransform(){ if(isTransforming && transformStartStrokesSnapshot){ strokes = JSON.parse(JSON.stringify(transformStartStrokesSnapshot)); pins = JSON.parse(JSON.stringify(transformStartPinsSnapshot)); selectionLocalBounds={...transformStartLocalBounds}; selectionCenter={...transformStartCenter}; selectionRotation=transformStartRotation; rebuildOffscreenCache(); renderDrawing(); isTransforming=false; transformStartStrokesSnapshot=null; updatePinsListUI(); } }
+        function onWheel(e){
+            if (isNameModalActive) return;
+            e.preventDefault();
+            const rect=drawingCanvas.getBoundingClientRect();
+            const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+            if(mx>=0&&mx<=canvasWidth&&my>=0&&my<=canvasHeight){
+                lastMouseScreenX=mx; lastMouseScreenY=my;
+                const delta=e.deltaY>0?0.9:1.1;
+                zoomAtScreen(mx,my,delta);
+                if(!isPanning&&!isDrawing&&!isLassoDrawing&&!isTransforming){ moveCursor(lastMouseScreenX,lastMouseScreenY); updateCursorVisibility(); }
+            }
+        }
+        function onKeyDown(e){
+            if (isNameModalActive) {
+                if (e.code === 'Escape') {
+                    if (modalMask) modalMask.click();
+                    e.preventDefault();
+                }
+                return;
+            }
+            if(e.code==='Space'){ e.preventDefault(); if(!spacePressed){ spacePressed=true; if(isDrawing) finalizeCurrentStroke(); if(isLassoDrawing) finalizeLasso(); if(!isPanning) drawingCanvas.style.cursor='grab'; updateCursorVisibility(); } return; }
+            if(e.code==='KeyQ'){ e.preventDefault(); setTool('pencil',false); return; }
+            if(e.code==='KeyE'){ e.preventDefault(); setTool('eraser',false); return; }
+            if(e.code==='KeyL'){ e.preventDefault(); setTool('lasso',false); return; }
+            if(e.code==='KeyP'){ e.preventDefault(); setTool('pin',false); return; }
+            if(e.ctrlKey&&e.code==='KeyZ'){ e.preventDefault(); undo(); return; }
+            if(e.ctrlKey&&e.code==='KeyY'){ e.preventDefault(); redo(); return; }
+            if(e.code==='Delete'||e.code==='Backspace'){ if(selectedItems.size>0){ e.preventDefault(); deleteSelected(); } }
+            if(e.code==='Escape'){ clearSelection(); if(isLassoDrawing){ isLassoDrawing=false; lassoPoints=[]; renderDrawing(); } closeEditPanel(); }
+        }
+        function onKeyUp(e){
+            if (isNameModalActive) return;
+            if(e.code==='Space'){ e.preventDefault(); spacePressed=false; if(isPanning) isPanning=false; if(!isPanning&&!isDrawing&&!isLassoDrawing&&!isTransforming) drawingCanvas.style.cursor='none'; updateCursorVisibility(); }
+        }
+        function disableContextMenu(e){ e.preventDefault(); return false; }
+        function onMouseLeaveCanvas(){ if(!isNameModalActive) customCursor.style.display='none'; }
+        function onMouseEnterCanvas(e){ if(isNameModalActive) return; if(!isPanning&&!isDrawing&&!isLassoDrawing&&!isTransforming){ const rect=drawingCanvas.getBoundingClientRect(); const sx=e.clientX-rect.left, sy=e.clientY-rect.top; if(sx>=0&&sx<=canvasWidth&&sy>=0&&sy<=canvasHeight){ lastMouseScreenX=sx; lastMouseScreenY=sy; moveCursor(sx,sy); updateCursorVisibility(); } } }
+        
+        function init(){
+            canvasWidth=window.innerWidth; canvasHeight=window.innerHeight;
+            gridCanvas.width=canvasWidth; gridCanvas.height=canvasHeight;
+            drawingCanvas.width=canvasWidth; drawingCanvas.height=canvasHeight;
+            initOffscreenCanvas();
+            offsetX=-canvasWidth/(2*scale)-80; offsetY=-canvasHeight/(2*scale)-60;
+            fullRender(); updateZoomDisplay();
+            setTool('pencil',false);
+            updateCursorSize(); updateSmoothUI();
+            commitHistory();
+            updatePinsListUI();
+            window.addEventListener('mousemove',onGlobalMouseMove);
+            brushSlider.addEventListener('input',e=>setCurrentWorldWidthFromSlider(e.target.value));
+            pencilBtn.addEventListener('click',e=>setTool('pencil',true,pencilBtn));
+            eraserBtn.addEventListener('click',e=>setTool('eraser',true,eraserBtn));
+            lassoBtn.addEventListener('click',e=>setTool('lasso',false));
+            pinBtn.addEventListener('click',e=>setTool('pin',false));
+            saveBtn.addEventListener('click',saveCanvas);
+            importBtn.addEventListener('click',triggerImport);
+            fileInput.addEventListener('change',onFileSelected);
+            smoothTrigger.addEventListener('click',toggleDropdown);
+            document.querySelectorAll('.smooth-option').forEach(opt=>opt.addEventListener('click',onOptionClick));
+            document.addEventListener('click',closeDropdownOnOutside);
+            drawingCanvas.addEventListener('pointerdown',onPointerDown);
+            drawingCanvas.addEventListener('pointermove',onPointerMove);
+            drawingCanvas.addEventListener('pointerup',onPointerUp);
+            drawingCanvas.addEventListener('pointercancel',onPointerCancel);
+            drawingCanvas.addEventListener('wheel',onWheel,{passive:false});
+            drawingCanvas.addEventListener('contextmenu',disableContextMenu);
+            drawingCanvas.addEventListener('mouseleave',onMouseLeaveCanvas);
+            drawingCanvas.addEventListener('mouseenter',onMouseEnterCanvas);
+            window.addEventListener('keydown',onKeyDown);
+            window.addEventListener('keyup',onKeyUp);
+            window.addEventListener('resize',()=>maintainCenterOnResize());
+            window.addEventListener('mouseup',()=>{ if(isDrawing) finalizeCurrentStroke(); if(isLassoDrawing) finalizeLasso(); if(isTransforming) endTransform(); if(isPanning){ isPanning=false; drawingCanvas.style.cursor='none'; updateCursorVisibility(); } });
+            document.addEventListener('click',handleDocumentClick);
+        }
+        init();
+    })();
+</script>
+</body>
+</html>
