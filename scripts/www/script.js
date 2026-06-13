@@ -48,6 +48,7 @@
     let isTransforming = false, transformType = null, transformStartMouseScreen = null;
     let transformStartSelectedSnapshot = null;
     let transformStartLocalBounds = null, transformStartCenter = null, transformStartRotation = 0, transformStartCornerIdx = 0, transformStartEdgeIdx = 0;
+    let transformHistoryDirtyScreenRect = null;
     const BORDER_WORLD_WIDTH = 1.5;
     const CONTROL_POINT_WORLD_SIZE = 6;
     const ROTATE_HANDLE_WORLD_SIZE = 17;
@@ -67,21 +68,23 @@
     let bgCtx = null;
     let bgCacheValid = false;
     
-    const GRID_CELL_SIZE = 200;
+    // 复制剪贴板
+    let copyBuffer = { strokes: [], pins: [] };
+    
+    let isZooming = false;
+    let zoomEndTimer = null;
+    function scheduleZoomEnd() {
+        if (zoomEndTimer) clearTimeout(zoomEndTimer);
+        isZooming = true;
+        zoomEndTimer = setTimeout(() => {
+            isZooming = false;
+            addDirtyRectForSelectionAndControls();
+            flushRendering();
+        }, 120);
+    }
+    
+    const GRID_CELL_SIZE = 100;
     let strokeGrid = new Map();
-    
-    // 辅助函数：根据基准宽度和压力(0~1)计算实际世界宽度
-    function getWidthFromPressure(baseWidth, pressure) {
-        // pressure 0 -> baseWidth - 2, 1 -> baseWidth + 2, 限定最小为1
-        let w = baseWidth + (pressure - 0.5) * 4;
-        return Math.max(1, Math.round(w));
-    }
-    
-    // 从点获取当前实际宽度（用于绘制时的半径）
-    function getRadiusFromPoint(point, baseWidth) {
-        const w = getWidthFromPressure(baseWidth, point.pressure);
-        return w / 2;
-    }
     
     function getGridKey(worldX, worldY) {
         const gx = Math.floor(worldX / GRID_CELL_SIZE);
@@ -152,10 +155,12 @@
     function addDirtyRectFromWorld(worldX, worldY, worldW, worldH) {
         const topLeft = worldToScreen(worldX, worldY);
         const bottomRight = worldToScreen(worldX + worldW, worldY + worldH);
-        const w = bottomRight.x - topLeft.x;
-        const h = bottomRight.y - topLeft.y;
+        let x = Math.floor(topLeft.x - 2);
+        let y = Math.floor(topLeft.y - 2);
+        let w = Math.ceil(bottomRight.x - topLeft.x + 4);
+        let h = Math.ceil(bottomRight.y - topLeft.y + 4);
         if (w > 0 && h > 0) {
-            addDirtyRect({ x: topLeft.x, y: topLeft.y, w, h });
+            addDirtyRect({ x, y, w, h });
         }
     }
     
@@ -163,6 +168,197 @@
         if (!stroke.bbox) updateStrokeBBox(stroke);
         const b = stroke.bbox;
         addDirtyRectFromWorld(b.minX - marginWorld, b.minY - marginWorld, b.maxX - b.minX + marginWorld*2, b.maxY - b.minY + marginWorld*2);
+    }
+    
+    function getWorldRectFromStrokes(strokesList) {
+        if (!strokesList || strokesList.length === 0) return null;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let item of strokesList) {
+            const stroke = item.stroke;
+            if (!stroke.bbox) updateStrokeBBox(stroke);
+            const b = stroke.bbox;
+            minX = Math.min(minX, b.minX);
+            minY = Math.min(minY, b.minY);
+            maxX = Math.max(maxX, b.maxX);
+            maxY = Math.max(maxY, b.maxY);
+        }
+        if (minX === Infinity) return null;
+        return { minX, minY, maxX, maxY };
+    }
+    
+    function addDirtyRectForPin(pin, marginWorld = 10) {
+        if (!pin) return;
+        const r = PIN_RADIUS_WORLD + marginWorld;
+        addDirtyRectFromWorld(pin.x - r, pin.y - r, r * 2, r * 2);
+    }
+    
+    function addDirtyRectForSelectionAndControls() {
+    if (selectedItems.size === 0) return;
+    const SHADOW_EXTRA = 10; // 屏幕像素，包裹阴影模糊范围
+    let screenMinX = Infinity, screenMinY = Infinity, screenMaxX = -Infinity, screenMaxY = -Infinity;
+    
+    for (let item of selectedItems) {
+        if (item[0] === 's') {
+            const idx = parseInt(item.slice(1));
+            const stroke = strokes[idx];
+            if (!stroke || stroke.type !== 'pencil') continue;
+            if (!stroke.points.length) continue;
+            const radius = stroke.worldWidth * scale;
+            for (let p of stroke.points) {
+                const sp = worldToScreen(p.x, p.y);
+                screenMinX = Math.min(screenMinX, sp.x - radius);
+                screenMinY = Math.min(screenMinY, sp.y - radius);
+                screenMaxX = Math.max(screenMaxX, sp.x + radius);
+                screenMaxY = Math.max(screenMaxY, sp.y + radius);
+            }
+        } else if (item[0] === 'p') {
+            const idx = parseInt(item.slice(1));
+            const pin = pins[idx];
+            if (pin) {
+                const center = worldToScreen(pin.x, pin.y);
+                const r = PIN_RADIUS_WORLD * scale;
+                screenMinX = Math.min(screenMinX, center.x - r);
+                screenMinY = Math.min(screenMinY, center.y - r);
+                screenMaxX = Math.max(screenMaxX, center.x + r);
+                screenMaxY = Math.max(screenMaxY, center.y + r);
+            }
+        }
+    }
+    
+    if (selectedItems.size > 0) {
+        const corners = getRotatedCorners();
+        for (let c of corners) {
+            const sp = worldToScreen(c.x, c.y);
+            // 增加阴影安全边距
+            const r = CONTROL_POINT_WORLD_SIZE * scale + SHADOW_EXTRA;
+            screenMinX = Math.min(screenMinX, sp.x - r);
+            screenMinY = Math.min(screenMinY, sp.y - r);
+            screenMaxX = Math.max(screenMaxX, sp.x + r);
+            screenMaxY = Math.max(screenMaxY, sp.y + r);
+        }
+        for (let i = 0; i < 4; i++) {
+            const edgeCenterWorld = getEdgeCenterWorld(i);
+            const sp = worldToScreen(edgeCenterWorld.x, edgeCenterWorld.y);
+            const r = CONTROL_POINT_WORLD_SIZE * scale + SHADOW_EXTRA;
+            screenMinX = Math.min(screenMinX, sp.x - r);
+            screenMinY = Math.min(screenMinY, sp.y - r);
+            screenMaxX = Math.max(screenMaxX, sp.x + r);
+            screenMaxY = Math.max(screenMaxY, sp.y + r);
+        }
+        const rotHandleWorld = getRotateHandleWorld();
+        const sp = worldToScreen(rotHandleWorld.x, rotHandleWorld.y);
+        // 旋转手柄背景半径 + 阴影余量
+        const r = Math.max(ROTATE_HANDLE_WORLD_SIZE * scale, ROTATE_ICON_WORLD_SIZE * scale) + SHADOW_EXTRA;
+        screenMinX = Math.min(screenMinX, sp.x - r);
+        screenMinY = Math.min(screenMinY, sp.y - r);
+        screenMaxX = Math.max(screenMaxX, sp.x + r);
+        screenMaxY = Math.max(screenMaxY, sp.y + r);
+    }
+    
+    if (screenMinX < Infinity && screenMaxX > -Infinity) {
+        const rect = {
+            x: Math.floor(screenMinX - 2),
+            y: Math.floor(screenMinY - 2),
+            w: Math.ceil(screenMaxX - screenMinX + 4),
+            h: Math.ceil(screenMaxY - screenMinY + 4)
+        };
+        if (rect.w > 0 && rect.h > 0) {
+            addDirtyRect(rect);
+        }
+    }
+}
+    
+    function getSelectionAndControlsScreenRect() {
+    if (selectedItems.size === 0) return null;
+    const SHADOW_EXTRA = 10;
+    let screenMinX = Infinity, screenMinY = Infinity, screenMaxX = -Infinity, screenMaxY = -Infinity;
+    for (let item of selectedItems) {
+        if (item[0] === 's') {
+            const idx = parseInt(item.slice(1));
+            const stroke = strokes[idx];
+            if (!stroke || stroke.type !== 'pencil') continue;
+            if (!stroke.points.length) continue;
+            const radius = stroke.worldWidth * scale;
+            for (let p of stroke.points) {
+                const sp = worldToScreen(p.x, p.y);
+                screenMinX = Math.min(screenMinX, sp.x - radius);
+                screenMinY = Math.min(screenMinY, sp.y - radius);
+                screenMaxX = Math.max(screenMaxX, sp.x + radius);
+                screenMaxY = Math.max(screenMaxY, sp.y + radius);
+            }
+        } else if (item[0] === 'p') {
+            const idx = parseInt(item.slice(1));
+            const pin = pins[idx];
+            if (pin) {
+                const center = worldToScreen(pin.x, pin.y);
+                const r = PIN_RADIUS_WORLD * scale;
+                screenMinX = Math.min(screenMinX, center.x - r);
+                screenMinY = Math.min(screenMinY, center.y - r);
+                screenMaxX = Math.max(screenMaxX, center.x + r);
+                screenMaxY = Math.max(screenMaxY, center.y + r);
+            }
+        }
+    }
+    if (selectedItems.size > 0) {
+        const corners = getRotatedCorners();
+        for (let c of corners) {
+            const sp = worldToScreen(c.x, c.y);
+            const r = CONTROL_POINT_WORLD_SIZE * scale + SHADOW_EXTRA;
+            screenMinX = Math.min(screenMinX, sp.x - r);
+            screenMinY = Math.min(screenMinY, sp.y - r);
+            screenMaxX = Math.max(screenMaxX, sp.x + r);
+            screenMaxY = Math.max(screenMaxY, sp.y + r);
+        }
+        for (let i = 0; i < 4; i++) {
+            const edgeCenterWorld = getEdgeCenterWorld(i);
+            const sp = worldToScreen(edgeCenterWorld.x, edgeCenterWorld.y);
+            const r = CONTROL_POINT_WORLD_SIZE * scale + SHADOW_EXTRA;
+            screenMinX = Math.min(screenMinX, sp.x - r);
+            screenMinY = Math.min(screenMinY, sp.y - r);
+            screenMaxX = Math.max(screenMaxX, sp.x + r);
+            screenMaxY = Math.max(screenMaxY, sp.y + r);
+        }
+        const rotHandleWorld = getRotateHandleWorld();
+        const sp = worldToScreen(rotHandleWorld.x, rotHandleWorld.y);
+        const r = Math.max(ROTATE_HANDLE_WORLD_SIZE * scale, ROTATE_ICON_WORLD_SIZE * scale) + SHADOW_EXTRA;
+        screenMinX = Math.min(screenMinX, sp.x - r);
+        screenMinY = Math.min(screenMinY, sp.y - r);
+        screenMaxX = Math.max(screenMaxX, sp.x + r);
+        screenMaxY = Math.max(screenMaxY, sp.y + r);
+    }
+    if (screenMinX === Infinity) return null;
+    const rect = {
+        x: Math.floor(screenMinX - 2),
+        y: Math.floor(screenMinY - 2),
+        w: Math.ceil(screenMaxX - screenMinX + 4),
+        h: Math.ceil(screenMaxY - screenMinY + 4)
+    };
+    return rect;
+}
+    
+    function getLassoScreenBounds() {
+        if (lassoPoints.length === 0) return null;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let p of lassoPoints) {
+            const sp = worldToScreen(p.x, p.y);
+            minX = Math.min(minX, sp.x);
+            minY = Math.min(minY, sp.y);
+            maxX = Math.max(maxX, sp.x);
+            maxY = Math.max(maxY, sp.y);
+        }
+        const extend = 4;
+        const rect = {
+            x: Math.floor(minX - extend),
+            y: Math.floor(minY - extend),
+            w: Math.ceil(maxX - minX + extend * 2),
+            h: Math.ceil(maxY - minY + extend * 2)
+        };
+        return rect;
+    }
+    
+    function addDirtyRectForLasso() {
+        const rect = getLassoScreenBounds();
+        if (rect && rect.w > 0 && rect.h > 0) addDirtyRect(rect);
     }
     
     function mergeRects(rects) {
@@ -179,7 +375,13 @@
     
     function flushRendering() {
         if (pendingDirtyRects.length === 0) return;
-        const rects = mergeRects(pendingDirtyRects);
+        let rects = mergeRects(pendingDirtyRects);
+        rects = rects.map(r => ({
+            x: Math.floor(r.x - 1),
+            y: Math.floor(r.y - 1),
+            w: Math.ceil(r.w + 2),
+            h: Math.ceil(r.h + 2)
+        }));
         pendingDirtyRects = [];
         for (let rect of rects) {
             renderDrawing(rect);
@@ -205,8 +407,8 @@
             super();
             this.stroke = {
                 type: stroke.type,
-                baseWidth: stroke.baseWidth,
-                points: stroke.points.map(p => ({ x: p.x, y: p.y, pressure: p.pressure }))
+                worldWidth: stroke.worldWidth,
+                points: stroke.points.map(p => ({ x: p.x, y: p.y }))
             };
             this.index = index;
             this.skipRedraw = skipRedraw;
@@ -225,14 +427,13 @@
             rebuildStrokeGrid();
             bgCacheValid = false;
             fullRepaint();
-            updatePinsListUI();
             updateBottomPanel();
         }
         redo() {
             const strokeCopy = {
                 type: this.stroke.type,
-                baseWidth: this.stroke.baseWidth,
-                points: this.stroke.points.map(p => ({ x: p.x, y: p.y, pressure: p.pressure }))
+                worldWidth: this.stroke.worldWidth,
+                points: this.stroke.points.map(p => ({ x: p.x, y: p.y }))
             };
             strokes.splice(this.index, 0, strokeCopy);
             updateStrokeBBox(strokes[this.index]);
@@ -256,8 +457,12 @@
                     const boundsWorld = strokeCopy.bbox;
                     const topLeft = worldToScreen(boundsWorld.minX, boundsWorld.minY);
                     const bottomRight = worldToScreen(boundsWorld.maxX, boundsWorld.maxY);
-                    const dirtyRect = { x: topLeft.x, y: topLeft.y, w: bottomRight.x - topLeft.x, h: bottomRight.y - topLeft.y };
-                    if (dirtyRect.w > 0 && dirtyRect.h > 0) {
+                    let x = Math.floor(topLeft.x - 2);
+                    let y = Math.floor(topLeft.y - 2);
+                    let w = Math.ceil(bottomRight.x - topLeft.x + 4);
+                    let h = Math.ceil(bottomRight.y - topLeft.y + 4);
+                    if (w > 0 && h > 0) {
+                        const dirtyRect = { x, y, w, h };
                         bgCtx.save();
                         bgCtx.beginPath();
                         bgCtx.rect(dirtyRect.x, dirtyRect.y, dirtyRect.w, dirtyRect.h);
@@ -271,15 +476,15 @@
                     }
                 }
             }
-            updatePinsListUI();
             updateBottomPanel();
         }
     }
     
     class DeleteStrokesCommand extends Command {
-        constructor(deleted) {
+        constructor(deleted, dirtyWorldRect = null) {
             super();
             this.deleted = JSON.parse(JSON.stringify(deleted));
+            this.dirtyWorldRect = dirtyWorldRect ? { ...dirtyWorldRect } : null;
         }
         undo() {
             for (let item of this.deleted.slice().sort((a,b)=>a.index-b.index)) {
@@ -299,12 +504,20 @@
             }
             selectedItems = newSelected;
             rebuildStrokeGrid();
-            bgCacheValid = false;
-            fullRepaint();
-            updatePinsListUI();
+            if (this.dirtyWorldRect) {
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                updateBackgroundCacheInRect(this.dirtyWorldRect);
+                flushRendering();
+            } else {
+                bgCacheValid = false;
+                fullRepaint();
+            }
             updateBottomPanel();
         }
         redo() {
+            if (this.dirtyWorldRect) {
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+            }
             for (let item of this.deleted.slice().sort((a,b)=>b.index-a.index)) {
                 strokes.splice(item.index, 1);
             }
@@ -320,39 +533,83 @@
             }
             selectedItems = newSelected;
             rebuildStrokeGrid();
-            bgCacheValid = false;
-            fullRepaint();
-            updatePinsListUI();
+            if (this.dirtyWorldRect) {
+                updateBackgroundCacheInRect(this.dirtyWorldRect);
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                flushRendering();
+            } else {
+                bgCacheValid = false;
+                fullRepaint();
+            }
             updateBottomPanel();
         }
     }
     
+    function updateBackgroundCacheInRect(worldRect) {
+        if (!bgCacheValid) {
+            rebuildBackgroundCache();
+            return;
+        }
+        const topLeft = worldToScreen(worldRect.minX, worldRect.minY);
+        const bottomRight = worldToScreen(worldRect.maxX, worldRect.maxY);
+        let x = Math.floor(topLeft.x - 2);
+        let y = Math.floor(topLeft.y - 2);
+        let w = Math.ceil(bottomRight.x - topLeft.x + 4);
+        let h = Math.ceil(bottomRight.y - topLeft.y + 4);
+        if (w <= 0 || h <= 0) return;
+        bgCtx.save();
+        bgCtx.beginPath();
+        bgCtx.rect(x, y, w, h);
+        bgCtx.clip();
+        bgCtx.clearRect(x, y, w, h);
+        for (const stroke of strokes) {
+            if (stroke.type === 'pencil' && isStrokeVisible(stroke, worldRect)) {
+                drawSingleStrokeToContext(bgCtx, stroke);
+            }
+        }
+        bgCtx.restore();
+        addDirtyRect({ x, y, w, h });
+    }
+    
     class ModifyStrokesCommand extends Command {
-        constructor(mods) {
+        constructor(mods, dirtyWorldRect = null) {
             super();
             this.mods = mods.map(m => ({
                 index: m.index,
-                oldPoints: m.oldPoints.map(p=>({x:p.x,y:p.y,pressure:p.pressure})),
-                newPoints: m.newPoints.map(p=>({x:p.x,y:p.y,pressure:p.pressure}))
+                oldPoints: m.oldPoints.map(p=>({x:p.x,y:p.y})),
+                newPoints: m.newPoints.map(p=>({x:p.x,y:p.y}))
             }));
+            this.dirtyWorldRect = dirtyWorldRect ? { ...dirtyWorldRect } : null;
         }
         undo() {
             for (let m of this.mods) {
-                strokes[m.index].points = m.oldPoints.map(p=>({x:p.x,y:p.y,pressure:p.pressure}));
+                strokes[m.index].points = m.oldPoints.map(p=>({x:p.x,y:p.y}));
                 updateStrokeBBox(strokes[m.index]);
             }
             rebuildStrokeGrid();
-            bgCacheValid = false;
-            fullRepaint();
+            if (this.dirtyWorldRect) {
+                updateBackgroundCacheInRect(this.dirtyWorldRect);
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                flushRendering();
+            } else {
+                bgCacheValid = false;
+                fullRepaint();
+            }
         }
         redo() {
             for (let m of this.mods) {
-                strokes[m.index].points = m.newPoints.map(p=>({x:p.x,y:p.y,pressure:p.pressure}));
+                strokes[m.index].points = m.newPoints.map(p=>({x:p.x,y:p.y}));
                 updateStrokeBBox(strokes[m.index]);
             }
             rebuildStrokeGrid();
-            bgCacheValid = false;
-            fullRepaint();
+            if (this.dirtyWorldRect) {
+                updateBackgroundCacheInRect(this.dirtyWorldRect);
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                flushRendering();
+            } else {
+                bgCacheValid = false;
+                fullRepaint();
+            }
         }
     }
     
@@ -363,14 +620,16 @@
             this.index = index;
         }
         undo() {
+            addDirtyRectForPin(this.pin);
             pins.splice(this.index, 1);
-            fullRepaint();
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
         redo() {
             pins.splice(this.index, 0, JSON.parse(JSON.stringify(this.pin)));
-            fullRepaint();
+            addDirtyRectForPin(pins[this.index]);
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
@@ -384,16 +643,18 @@
         undo() {
             for (let d of this.deleted.slice().sort((a,b)=>a.index-b.index)) {
                 pins.splice(d.index, 0, JSON.parse(JSON.stringify(d.pin)));
+                addDirtyRectForPin(pins[d.index]);
             }
-            fullRepaint();
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
         redo() {
             for (let d of this.deleted.slice().sort((a,b)=>b.index-a.index)) {
+                addDirtyRectForPin(d.pin);
                 pins.splice(d.index, 1);
             }
-            fullRepaint();
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
@@ -407,14 +668,18 @@
             this.newPin = JSON.parse(JSON.stringify(newPin));
         }
         undo() {
+            addDirtyRectForPin(pins[this.index]);
             pins[this.index] = this.oldPin;
-            fullRepaint();
+            addDirtyRectForPin(pins[this.index]);
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
         redo() {
+            addDirtyRectForPin(pins[this.index]);
             pins[this.index] = this.newPin;
-            fullRepaint();
+            addDirtyRectForPin(pins[this.index]);
+            flushRendering();
             updatePinsListUI();
             updateBottomPanel();
         }
@@ -424,21 +689,50 @@
         constructor(mods) {
             super();
             this.mods = mods.map(m=>({...m}));
+            if (mods.length > 0) {
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                for (let m of mods) {
+                    const r = PIN_RADIUS_WORLD;
+                    minX = Math.min(minX, m.oldX - r, m.newX - r);
+                    minY = Math.min(minY, m.oldY - r, m.newY - r);
+                    maxX = Math.max(maxX, m.oldX + r, m.newX + r);
+                    maxY = Math.max(maxY, m.oldY + r, m.newY + r);
+                }
+                this.dirtyWorldRect = { minX, minY, maxX, maxY };
+            } else {
+                this.dirtyWorldRect = null;
+            }
         }
         undo() {
             for (let m of this.mods) {
-                pins[m.index].x = m.oldX;
-                pins[m.index].y = m.oldY;
+                const pin = pins[m.index];
+                if (pin) {
+                    pin.x = m.oldX;
+                    pin.y = m.oldY;
+                }
             }
-            fullRepaint();
+            if (this.dirtyWorldRect) {
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                flushRendering();
+            } else {
+                fullRepaint();
+            }
             updatePinsListUI();
         }
         redo() {
             for (let m of this.mods) {
-                pins[m.index].x = m.newX;
-                pins[m.index].y = m.newY;
+                const pin = pins[m.index];
+                if (pin) {
+                    pin.x = m.newX;
+                    pin.y = m.newY;
+                }
             }
-            fullRepaint();
+            if (this.dirtyWorldRect) {
+                addDirtyRectFromWorld(this.dirtyWorldRect.minX, this.dirtyWorldRect.minY, this.dirtyWorldRect.maxX - this.dirtyWorldRect.minX, this.dirtyWorldRect.maxY - this.dirtyWorldRect.minY);
+                flushRendering();
+            } else {
+                fullRepaint();
+            }
             updatePinsListUI();
         }
     }
@@ -536,13 +830,13 @@
         }
         let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
         for (let p of stroke.points) {
-            const r = getRadiusFromPoint(p, stroke.baseWidth);
-            minX = Math.min(minX, p.x - r);
-            minY = Math.min(minY, p.y - r);
-            maxX = Math.max(maxX, p.x + r);
-            maxY = Math.max(maxY, p.y + r);
+            if (p.x<minX) minX=p.x;
+            if (p.y<minY) minY=p.y;
+            if (p.x>maxX) maxX=p.x;
+            if (p.y>maxY) maxY=p.y;
         }
-        stroke.bbox = { minX, minY, maxX, maxY };
+        const r = stroke.worldWidth/2;
+        stroke.bbox = { minX:minX-r, minY:minY-r, maxX:maxX+r, maxY:maxY+r };
     }
     
     function getVisibleWorldRect() {
@@ -557,59 +851,100 @@
         return !(b.maxX<rect.minX || b.minX>rect.maxX || b.maxY<rect.minY || b.minY>rect.maxY);
     }
     
-    function pointToSegmentDistance(px,py,x1,y1,x2,y2) {
-        const ax=px-x1, ay=py-y1;
-        const bx=x2-x1, by=y2-y1;
-        const dot=ax*bx+ay*by;
-        const len2=bx*bx+by*by;
-        if(len2===0) return Math.hypot(ax,ay);
-        let t=dot/len2;
-        t=Math.max(0,Math.min(1,t));
-        const projX=x1+t*bx, projY=y1+t*by;
-        return Math.hypot(px-projX, py-projY);
-    }
+    function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+    const ax = px - x1, ay = py - y1;
+    const bx = x2 - x1, by = y2 - y1;
+    const dot = ax * bx + ay * by;
+    const len2 = bx * bx + by * by;
+    if (len2 === 0) return ax * ax + ay * ay;
+    let t = dot / len2;
+    t = Math.max(0, Math.min(1, t));
+    const projX = x1 + t * bx, projY = y1 + t * by;
+    const dx = px - projX, dy = py - projY;
+    return dx * dx + dy * dy;
+}
     
     function collectEraserChanges(eraserStroke) {
-        if(!eraserStroke || eraserStroke.points.length<2) return {toDelete:[]};
-        const eraserRadius = eraserStroke.worldWidth/2;
-        let eraserMinX=Infinity, eraserMinY=Infinity, eraserMaxX=-Infinity, eraserMaxY=-Infinity;
-        for(let p of eraserStroke.points){
-            eraserMinX=Math.min(eraserMinX,p.x); eraserMinY=Math.min(eraserMinY,p.y);
-            eraserMaxX=Math.max(eraserMaxX,p.x); eraserMaxY=Math.max(eraserMaxY,p.y);
-        }
-        eraserMinX-=eraserRadius; eraserMinY-=eraserRadius;
-        eraserMaxX+=eraserRadius; eraserMaxY+=eraserRadius;
-        const eraserWorldRect = { minX: eraserMinX, minY: eraserMinY, maxX: eraserMaxX, maxY: eraserMaxY };
-        const candidates = queryStrokesInWorldRect(eraserWorldRect);
-        const toDelete=[];
-        for(let idx of candidates){
-            const st=strokes[idx];
-            if(!st) continue;
-            if(st.type==='pencil'){
-                let hit=false;
-                const pts=st.points;
-                if(pts.length<2) continue;
-                outer: for(let ep of eraserStroke.points){
-                    for(let i=0;i<pts.length-1;i++){
-                        const r0 = getRadiusFromPoint(pts[i], st.baseWidth);
-                        const r1 = getRadiusFromPoint(pts[i+1], st.baseWidth);
-                        // 粗略检测：线段到点距离小于两半径之和即碰撞
-                        if(pointToSegmentDistance(ep.x,ep.y, pts[i].x,pts[i].y, pts[i+1].x,pts[i+1].y) <= eraserRadius + Math.max(r0,r1)){
-                            hit=true; break outer;
+    
+    if (!eraserStroke || eraserStroke.points.length === 0) return { toDelete: [] };
+    const eraserRadius = eraserStroke.worldWidth / 2;
+    const eraserRadiusSq = eraserRadius * eraserRadius;
+    
+    // 橡皮擦包围盒（用于网格查询）
+    let eraserMinX = Infinity, eraserMinY = Infinity, eraserMaxX = -Infinity, eraserMaxY = -Infinity;
+    for (let p of eraserStroke.points) {
+        eraserMinX = Math.min(eraserMinX, p.x);
+        eraserMinY = Math.min(eraserMinY, p.y);
+        eraserMaxX = Math.max(eraserMaxX, p.x);
+        eraserMaxY = Math.max(eraserMaxY, p.y);
+    }
+    eraserMinX -= eraserRadius;
+    eraserMinY -= eraserRadius;
+    eraserMaxX += eraserRadius;
+    eraserMaxY += eraserRadius;
+    const eraserWorldRect = { minX: eraserMinX, minY: eraserMinY, maxX: eraserMaxX, maxY: eraserMaxY };
+    const candidates = queryStrokesInWorldRect(eraserWorldRect);
+    const toDelete = [];
+    
+    // 对橡皮擦点进行采样，步长为2（减少点数，同时保留足够覆盖）
+    const sampledPoints = [];
+    const step = 2;  // 每隔一个点取一个
+    for (let i = 0; i < eraserStroke.points.length; i += step) {
+        sampledPoints.push(eraserStroke.points[i]);
+    }
+    // 确保包含最后一个点
+    if (sampledPoints[sampledPoints.length - 1] !== eraserStroke.points[eraserStroke.points.length - 1]) {
+        sampledPoints.push(eraserStroke.points[eraserStroke.points.length - 1]);
+    }
+    
+    for (let idx of candidates) {
+        const st = strokes[idx];
+        if (!st) continue;
+        if (st.type === 'pencil') {
+            const strokeRadius = st.worldWidth / 2;
+            const strokeRadiusSq = strokeRadius * strokeRadius;
+            const combinedRadiusSq = eraserRadiusSq + strokeRadiusSq + 2 * eraserRadius * strokeRadius; // (r1+r2)^2
+            let hit = false;
+            const pts = st.points;
+            if (pts.length === 0) continue;
+            
+            // 如果橡皮擦只有一个采样点，直接比较点与笔画点的距离
+            if (sampledPoints.length === 1) {
+                const center = sampledPoints[0];
+                for (let pt of pts) {
+                    const dx = pt.x - center.x, dy = pt.y - center.y;
+                    if (dx * dx + dy * dy <= combinedRadiusSq) {
+                        hit = true;
+                        break;
+                    }
+                }
+            } else {
+                // 遍历橡皮擦采样点，对每个点检测到笔画线段的平方距离
+                outer: for (let ep of sampledPoints) {
+                    for (let i = 0; i < pts.length - 1; i++) {
+                        const distSq = pointToSegmentDistance(ep.x, ep.y, pts[i].x, pts[i].y, pts[i+1].x, pts[i+1].y);
+                        if (distSq <= combinedRadiusSq) {
+                            hit = true;
+                            break outer;
                         }
                     }
-                    for(let pt of pts){
-                        const r = getRadiusFromPoint(pt, st.baseWidth);
-                        if(Math.hypot(ep.x-pt.x, ep.y-pt.y) <= eraserRadius + r){
-                            hit=true; break outer;
+                    // 检测到笔画端点的距离
+                    for (let pt of pts) {
+                        const dx = ep.x - pt.x, dy = ep.y - pt.y;
+                        if (dx * dx + dy * dy <= combinedRadiusSq) {
+                            hit = true;
+                            break outer;
                         }
                     }
                 }
-                if(hit) toDelete.push({index:idx, stroke:JSON.parse(JSON.stringify(st)), wasSelected:selectedItems.has('s'+idx)});
+            }
+            if (hit) {
+                toDelete.push({ index: idx, stroke: JSON.parse(JSON.stringify(st)), wasSelected: selectedItems.has('s' + idx) });
             }
         }
-        return {toDelete};
     }
+    return { toDelete };
+}
     
     function isParallel(v1, v2, threshold = 0.95) {
         const dot = v1.x * v2.x + v1.y * v2.y;
@@ -772,37 +1107,13 @@
         return result;
     }
     
-    // 压力插值辅助：根据原始点数组和插值坐标，通过比例插值压力
-    function interpolatePressure(rawPoints, x, y) {
-        if (!rawPoints || rawPoints.length === 0) return 0.5;
-        if (rawPoints.length === 1) return rawPoints[0].pressure;
-        // 找到曲线上最近的两个点，按距离加权
-        let minDist = Infinity, bestIdx = 0;
-        for (let i = 0; i < rawPoints.length; i++) {
-            const d = Math.hypot(x - rawPoints[i].x, y - rawPoints[i].y);
-            if (d < minDist) { minDist = d; bestIdx = i; }
-        }
-        // 取邻近两点（前后）加权平均
-        let left = rawPoints[bestIdx];
-        let right = rawPoints[bestIdx];
-        if (bestIdx > 0) left = rawPoints[bestIdx-1];
-        if (bestIdx < rawPoints.length-1) right = rawPoints[bestIdx+1];
-        const distLeft = Math.hypot(x - left.x, y - left.y);
-        const distRight = Math.hypot(x - right.x, y - right.y);
-        const total = distLeft + distRight;
-        if (total < 1e-6) return left.pressure;
-        const wLeft = distRight / total;
-        const wRight = distLeft / total;
-        return left.pressure * wLeft + right.pressure * wRight;
-    }
-    
     function attemptStraightenStroke() {
         if (!currentStroke || strokeModifiedByRecog) return false;
         const points = currentStroke.points;
         if (points.length < 2) return false;
         
-        const A = { x: points[0].x, y: points[0].y };
-        const B = { x: points[points.length - 1].x, y: points[points.length - 1].y };
+        const A = points[0];
+        const B = points[points.length - 1];
         const ABlen = Math.hypot(B.x - A.x, B.y - A.y);
         if (ABlen < 0.01) return false;
         
@@ -820,14 +1131,14 @@
                 ellipse.a = r;
                 ellipse.b = r;
             }
+            const oldBounds = getStrokeScreenBounds(currentStroke);
+            if (oldBounds) addDirtyRect(oldBounds);
+            
             const ellipsePoints = generateEllipsePoints(ellipse.center, ellipse.a, ellipse.b, ellipse.theta, maxGap);
             if (ellipsePoints.length >= 2) {
-                // 识别后：所有点压力设为0.5，baseWidth为当前笔刷基准宽度
-                const newPoints = ellipsePoints.map(p => ({ x: p.x, y: p.y, pressure: 0.5 }));
                 currentStroke.type = 'pencil';
-                currentStroke.points = newPoints;
-                currentStroke.rawPoints = newPoints.slice();
-                currentStroke.baseWidth = pencilWorldWidth;
+                currentStroke.points = ellipsePoints;
+                currentStroke.rawPoints = ellipsePoints.slice();
             } else {
                 strokeModifiedByRecog = false;
                 return false;
@@ -846,7 +1157,7 @@
                 farthestIndex = i;
             }
         }
-        const C = { x: points[farthestIndex].x, y: points[farthestIndex].y };
+        const C = points[farthestIndex];
         const threshold = ABlen / 14;
         
         if (maxDist < threshold) {
@@ -865,22 +1176,24 @@
             } else {
                 linePoints = interpolateLinePoints(A, B, maxGap);
             }
-            const newPoints = linePoints.map(p => ({ x: p.x, y: p.y, pressure: 0.5 }));
+            const oldBounds = getStrokeScreenBounds(currentStroke);
+            if (oldBounds) addDirtyRect(oldBounds);
+            
             currentStroke.type = 'pencil';
-            currentStroke.points = newPoints;
-            currentStroke.rawPoints = newPoints.slice();
-            currentStroke.baseWidth = pencilWorldWidth;
+            currentStroke.points = linePoints;
+            currentStroke.rawPoints = linePoints.slice();
             finalizeCurrentStroke();
             return true;
         } else {
             strokeModifiedByRecog = true;
             const bezierPoints = fitCubicBezierThroughThreePoints(A, C, B, maxGap);
             if (bezierPoints.length >= 2) {
-                const newPoints = bezierPoints.map(p => ({ x: p.x, y: p.y, pressure: 0.5 }));
+                const oldBounds = getStrokeScreenBounds(currentStroke);
+                if (oldBounds) addDirtyRect(oldBounds);
+                
                 currentStroke.type = 'pencil';
-                currentStroke.points = newPoints;
-                currentStroke.rawPoints = newPoints.slice();
-                currentStroke.baseWidth = pencilWorldWidth;
+                currentStroke.points = bezierPoints;
+                currentStroke.rawPoints = bezierPoints.slice();
             } else {
                 strokeModifiedByRecog = false;
                 return false;
@@ -895,15 +1208,14 @@
         const result = [];
         const half = Math.floor(windowSize / 2);
         for (let i = 0; i < points.length; i++) {
-            let sumX = 0, sumY = 0, sumP = 0, count = 0;
+            let sumX = 0, sumY = 0, count = 0;
             for (let j = -half; j <= half; j++) {
                 const idx = Math.min(Math.max(i + j, 0), points.length - 1);
                 sumX += points[idx].x;
                 sumY += points[idx].y;
-                sumP += points[idx].pressure;
                 count++;
             }
-            result.push({ x: sumX / count, y: sumY / count, pressure: sumP / count });
+            result.push({ x: sumX / count, y: sumY / count });
         }
         return result;
     }
@@ -926,9 +1238,7 @@
                 (-p0.y + p2.y) * t +
                 (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
                 (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
-            // 压力也线性插值（基于t）
-            const pressure = p1.pressure * (1 - t) + p2.pressure * t;
-            points.push({ x, y, pressure });
+            points.push({ x, y });
         }
         return points;
     }
@@ -956,8 +1266,8 @@
             }
         }
         if (result.length > 0 && rawPoints.length > 0) {
-            result[0] = { ...rawPoints[0] };
-            result[result.length-1] = { ...rawPoints[rawPoints.length-1] };
+            result[0] = rawPoints[0];
+            result[result.length-1] = rawPoints[rawPoints.length-1];
         }
         return result;
     }
@@ -974,86 +1284,39 @@
     }
     
     function drawSingleStrokeToContext(ctx, stroke) {
-    if(stroke.type !== 'pencil') {
-        // 橡皮擦原样绘制（固定宽度虚线）
-        if(stroke.points.length < 2) return;
+        if(!stroke.points || stroke.points.length < 2) return;
         ctx.save();
-        ctx.beginPath();
-        ctx.lineCap='round';
-        ctx.lineJoin='round';
-        ctx.lineWidth=stroke.worldWidth * scale;
-        ctx.strokeStyle='rgba(100,116,139,0.4)';
-        ctx.setLineDash([8, 6]);
-        const first = worldToScreen(stroke.points[0].x, stroke.points[0].y);
-        ctx.moveTo(first.x, first.y);
-        for(let i=1;i<stroke.points.length;i++){
-            const p = worldToScreen(stroke.points[i].x, stroke.points[i].y);
-            ctx.lineTo(p.x, p.y);
+        if(stroke.type === 'pencil') {
+            ctx.beginPath();
+            ctx.lineCap='round';
+            ctx.lineJoin='round';
+            ctx.lineWidth=stroke.worldWidth * scale;
+            ctx.strokeStyle=PENCIL_COLOR;
+            const first = worldToScreen(stroke.points[0].x, stroke.points[0].y);
+            ctx.moveTo(first.x, first.y);
+            for(let i=1;i<stroke.points.length;i++){
+                const p = worldToScreen(stroke.points[i].x, stroke.points[i].y);
+                ctx.lineTo(p.x, p.y);
+            }
+            ctx.stroke();
+        } else if(stroke.type === 'eraser') {
+            ctx.beginPath();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.lineWidth = stroke.worldWidth * scale;
+            ctx.strokeStyle = 'rgba(100,116,139,0.4)';
+            ctx.setLineDash([8, 6]);
+            const first = worldToScreen(stroke.points[0].x, stroke.points[0].y);
+            ctx.moveTo(first.x, first.y);
+            for(let i=1; i<stroke.points.length; i++) {
+                const p = worldToScreen(stroke.points[i].x, stroke.points[i].y);
+                ctx.lineTo(p.x, p.y);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
         }
-        ctx.stroke();
-        ctx.setLineDash([]);
         ctx.restore();
-        return;
     }
-    
-    // 铅笔：可变宽度，通过绘制圆形 + 四边形实现平滑连接
-    const points = stroke.points;
-    if (points.length < 2) return;
-    const baseWidth = stroke.baseWidth;
-    ctx.save();
-    ctx.fillStyle = PENCIL_COLOR;
-    
-    // 获取屏幕坐标及半径
-    const screenPoints = points.map(p => {
-        const sp = worldToScreen(p.x, p.y);
-        const r = getRadiusFromPoint(p, baseWidth) * scale;
-        return { x: sp.x, y: sp.y, r };
-    });
-    
-    // 辅助函数：计算两点间的外公切线四边形顶点（返回四个点）
-    function getConnectingQuad(p0, p1) {
-        const dx = p1.x - p0.x;
-        const dy = p1.y - p0.y;
-        const len = Math.hypot(dx, dy);
-        if (len < 0.001) return null;
-        const nx = dy / len;   // 单位法线（垂直于连线）
-        const ny = -dx / len;
-        // 两个圆的切点偏移
-        const off0x = nx * p0.r;
-        const off0y = ny * p0.r;
-        const off1x = nx * p1.r;
-        const off1y = ny * p1.r;
-        return [
-            { x: p0.x - off0x, y: p0.y - off0y },  // p0 左侧
-            { x: p1.x - off1x, y: p1.y - off1y },  // p1 左侧
-            { x: p1.x + off1x, y: p1.y + off1y },  // p1 右侧
-            { x: p0.x + off0x, y: p0.y + off0y }   // p0 右侧
-        ];
-    }
-    
-    // 绘制所有线段之间的四边形
-    for (let i = 0; i < screenPoints.length - 1; i++) {
-        const quad = getConnectingQuad(screenPoints[i], screenPoints[i+1]);
-        if (!quad) continue;
-        ctx.beginPath();
-        ctx.moveTo(quad[0].x, quad[0].y);
-        ctx.lineTo(quad[1].x, quad[1].y);
-        ctx.lineTo(quad[2].x, quad[2].y);
-        ctx.lineTo(quad[3].x, quad[3].y);
-        ctx.closePath();
-        ctx.fill();
-    }
-    
-    // 绘制每个点的圆形（保证端点圆润，并覆盖四边形连接处的微小缝隙）
-    for (let i = 0; i < screenPoints.length; i++) {
-        const p = screenPoints[i];
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r, 0, 2 * Math.PI);
-        ctx.fill();
-    }
-    
-    ctx.restore();
-}
     
     function renderDrawing(dirtyRect) {
         if (!bgCacheValid) {
@@ -1069,19 +1332,28 @@
             drawTransformControls();
             return;
         }
-        const { x, y, w, h } = dirtyRect;
+        let x = Math.floor(dirtyRect.x);
+        let y = Math.floor(dirtyRect.y);
+        let w = Math.ceil(dirtyRect.w);
+        let h = Math.ceil(dirtyRect.h);
+        
+        drawCtx.save();
+        drawCtx.beginPath();
+        drawCtx.rect(x, y, w, h);
+        drawCtx.clip();
+        
         drawCtx.clearRect(x, y, w, h);
         drawCtx.drawImage(bgCanvas, x, y, w, h, x, y, w, h);
         if (currentStroke && currentStroke.points && currentStroke.points.length >= 2) {
             const currentBounds = getStrokeScreenBounds(currentStroke);
-            if (currentBounds && rectIntersect(currentBounds, dirtyRect)) {
+            if (currentBounds && rectIntersect(currentBounds, { x, y, w, h })) {
                 drawSingleStrokeToContext(drawCtx, currentStroke);
             }
         }
         for (let pin of pins) {
             const pinScreen = worldToScreen(pin.x, pin.y);
             const pinRect = { x: pinScreen.x - PIN_RADIUS_WORLD*scale, y: pinScreen.y - PIN_RADIUS_WORLD*scale, w: PIN_RADIUS_WORLD*scale*2, h: PIN_RADIUS_WORLD*scale*2 };
-            if (rectIntersect(pinRect, dirtyRect)) {
+            if (rectIntersect(pinRect, { x, y, w, h })) {
                 drawPin(drawCtx, pin);
             }
         }
@@ -1090,6 +1362,8 @@
         }
         drawSelectedHighlights();
         drawTransformControls();
+        
+        drawCtx.restore();
     }
     
     function getStrokeScreenBounds(stroke) {
@@ -1097,13 +1371,13 @@
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (let p of stroke.points) {
             const sp = worldToScreen(p.x, p.y);
-            const r = getRadiusFromPoint(p, stroke.baseWidth) * scale;
-            minX = Math.min(minX, sp.x - r);
-            minY = Math.min(minY, sp.y - r);
-            maxX = Math.max(maxX, sp.x + r);
-            maxY = Math.max(maxY, sp.y + r);
+            minX = Math.min(minX, sp.x);
+            minY = Math.min(minY, sp.y);
+            maxX = Math.max(maxX, sp.x);
+            maxY = Math.max(maxY, sp.y);
         }
-        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+        const radius = stroke.worldWidth * scale;
+        return { x: minX - radius, y: minY - radius, w: maxX - minX + radius*2, h: maxY - minY + radius*2 };
     }
     
     function rectIntersect(r1, r2) {
@@ -1112,6 +1386,7 @@
     
     function drawSelectedHighlights() {
         if(selectedItems.size===0) return;
+        if (isZooming) return; 
         drawCtx.save();
         const visibleRect = getVisibleWorldRect();
         for(let item of selectedItems){
@@ -1129,7 +1404,8 @@
                             const p=worldToScreen(stroke.points[i].x,stroke.points[i].y);
                             drawCtx.lineTo(p.x,p.y);
                         }
-                        drawCtx.lineWidth=3*scale;
+                    
+                        drawCtx.lineWidth = 3;
                         drawCtx.strokeStyle='#3b82f6';
                         drawCtx.stroke();
                     }
@@ -1141,7 +1417,7 @@
                     const cs=worldToScreen(pin.x,pin.y);
                     drawCtx.beginPath();
                     drawCtx.arc(cs.x,cs.y,PIN_RADIUS_WORLD*scale,0,2*Math.PI);
-                    drawCtx.lineWidth=3*scale;
+                    drawCtx.lineWidth = 3;
                     drawCtx.strokeStyle='#3b82f6';
                     drawCtx.stroke();
                 }
@@ -1151,6 +1427,7 @@
     }
     
     function applyMove(dx,dy){
+        addDirtyRectForSelectionAndControls();
         for(let item of selectedItems) {
             if(item[0]==='s'){
                 const idx=parseInt(item.slice(1));
@@ -1169,8 +1446,10 @@
         selectionCenter.x+=dx; selectionCenter.y+=dy;
         rebuildStrokeGrid();
         markCacheDirty();
-        fullRepaint();
+        addDirtyRectForSelectionAndControls();
+        flushRendering();
     }
+    
     function applyRotate(delta){
         const cos=Math.cos(delta), sin=Math.sin(delta), cx=selectionCenter.x, cy=selectionCenter.y;
         for(let item of selectedItems){
@@ -1199,8 +1478,8 @@
         selectionRotation=((selectionRotation%(2*Math.PI))+2*Math.PI)%(2*Math.PI);
         rebuildStrokeGrid();
         markCacheDirty();
-        fullRepaint();
     }
+    
     function applyCornerScale(fixed,factor){
         for(let item of selectedItems){
             if(item[0]==='s'){
@@ -1225,8 +1504,8 @@
         recomputeSelectionBounds();
         rebuildStrokeGrid();
         markCacheDirty();
-        fullRepaint();
     }
+    
     function applyEdgeScale(fixed,axis,factor){
         for(let item of selectedItems){
             if(item[0]==='s'){
@@ -1259,7 +1538,6 @@
         recomputeSelectionBounds();
         rebuildStrokeGrid();
         markCacheDirty();
-        fullRepaint();
     }
     
     function isStrokeSelected(stroke, poly){
@@ -1284,15 +1562,30 @@
         if(selectedItems.size===0){ selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionCenter={x:0,y:0}; return; }
         let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
         for(let item of selectedItems){
-            if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ const r = getRadiusFromPoint(p, stroke.baseWidth); if(p.x-r<minX)minX=p.x-r; if(p.y-r<minY)minY=p.y-r; if(p.x+r>maxX)maxX=p.x+r; if(p.y+r>maxY)maxY=p.y+r;} }
+            if(item[0]==='s'){ const idx=parseInt(item.slice(1)); const stroke=strokes[idx]; if(stroke) for(let p of stroke.points){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y;} }
             else if(item[0]==='p'){ const idx=parseInt(item.slice(1)); const pin=pins[idx]; if(pin){ const r=PIN_RADIUS_WORLD; minX=Math.min(minX,pin.x-r); minY=Math.min(minY,pin.y-r); maxX=Math.max(maxX,pin.x+r); maxY=Math.max(maxY,pin.y+r); } }
         }
         selectionLocalBounds={x:minX,y:minY,w:maxX-minX,h:maxY-minY}; selectionCenter={x:minX+(maxX-minX)/2,y:minY+(maxY-minY)/2};
+        addDirtyRectForSelectionAndControls();
     }
     
     function getRotatedCorners() { const cx=selectionCenter.x, cy=selectionCenter.y, halfW=selectionLocalBounds.w/2, halfH=selectionLocalBounds.h/2; const localCorners = [{x:-halfW,y:-halfH},{x: halfW,y:-halfH},{x: halfW,y: halfH},{x:-halfW,y: halfH}]; const cos=Math.cos(selectionRotation), sin=Math.sin(selectionRotation); return localCorners.map(p=>({ x:cx+p.x*cos-p.y*sin, y:cy+p.x*sin+p.y*cos })); }
     function getEdgeCenterWorld(edgeIdx) { const corners=getRotatedCorners(); const idx1=edgeIdx, idx2=(edgeIdx+1)%4; return { x:(corners[idx1].x+corners[idx2].x)/2, y:(corners[idx1].y+corners[idx2].y)/2 }; }
-    function getRotateHandleWorld() { const topMid=getEdgeCenterWorld(0); const dir={x:topMid.x-selectionCenter.x, y:topMid.y-selectionCenter.y}; const len=Math.hypot(dir.x,dir.y); if(len===0) return topMid; const norm={x:dir.x/len, y:dir.y/len}; const offsetWorld = ROTATE_HANDLE_WORLD_SIZE + 16; return { x:topMid.x+norm.x*offsetWorld, y:topMid.y+norm.y*offsetWorld }; }
+    function getRotateHandleWorld() {
+        const topMid = getEdgeCenterWorld(0);
+        const topMidScreen = worldToScreen(topMid.x, topMid.y);
+        const centerScreen = worldToScreen(selectionCenter.x, selectionCenter.y);
+        const dirScreen = { x: topMidScreen.x - centerScreen.x, y: topMidScreen.y - centerScreen.y };
+        const lenScreen = Math.hypot(dirScreen.x, dirScreen.y);
+        if (lenScreen === 0) return topMid;
+        const normScreen = { x: dirScreen.x / lenScreen, y: dirScreen.y / lenScreen };
+        const offsetScreen = 50;   
+        const handleScreen = {
+            x: topMidScreen.x + normScreen.x * offsetScreen,
+            y: topMidScreen.y + normScreen.y * offsetScreen
+        };
+        return screenToWorld(handleScreen.x, handleScreen.y);
+    }
     function drawRotateIcon(ctx, worldSize) { ctx.save(); ctx.scale(worldSize/24,worldSize/24); ctx.translate(-12,-12); ctx.strokeStyle='#fff'; ctx.fillStyle='#fff'; ctx.lineWidth=2; ctx.lineCap='round'; ctx.lineJoin='round'; const p1=new Path2D("M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"); const p2=new Path2D("M3 3v5h5"); const p3=new Path2D("M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"); const p4=new Path2D("M16 16h5v5"); ctx.stroke(p1); ctx.stroke(p2); ctx.stroke(p3); ctx.stroke(p4); ctx.beginPath(); ctx.arc(12,12,1,0,2*Math.PI); ctx.fill(); ctx.restore(); }
     function hitTestTransformControls(screenX, screenY) { 
         if (selectedItems.size === 0) return null;
@@ -1313,37 +1606,78 @@
         if (pointInPolygon(world.x, world.y, corners)) return { type: 'move' };
         return null;
     }
+    
     function drawTransformControls() {
-        if(selectedItems.size===0) return;
-        const corners=getRotatedCorners();
-        const screenCorners=corners.map(p=>worldToScreen(p.x,p.y));
+        if (selectedItems.size === 0) return;
+        if (isZooming) return; 
+        const corners = getRotatedCorners();
+        const screenCorners = corners.map(p => worldToScreen(p.x, p.y));
         drawCtx.save();
-        drawCtx.fillStyle='rgba(59,130,246,0.15)';
-        drawCtx.strokeStyle='#3b82f6';
-        drawCtx.lineWidth=BORDER_WORLD_WIDTH*scale;
+        
+        drawCtx.fillStyle = 'rgba(59,130,246,0.15)';
+        drawCtx.strokeStyle = '#3b82f6';
+        drawCtx.lineWidth = 2;
         drawCtx.beginPath();
-        drawCtx.moveTo(screenCorners[0].x,screenCorners[0].y);
-        for(let i=1;i<4;i++) drawCtx.lineTo(screenCorners[i].x,screenCorners[i].y);
+        drawCtx.moveTo(screenCorners[0].x, screenCorners[0].y);
+        for (let i = 1; i < 4; i++) drawCtx.lineTo(screenCorners[i].x, screenCorners[i].y);
         drawCtx.closePath();
         drawCtx.fill();
         drawCtx.stroke();
-        drawCtx.fillStyle='#3b82f6';
-        for(let pt of screenCorners){ drawCtx.beginPath(); drawCtx.arc(pt.x, pt.y, CONTROL_POINT_WORLD_SIZE*scale, 0, 2*Math.PI); drawCtx.fill(); }
-        for(let i=0;i<4;i++){ const edgeCenterWorld = getEdgeCenterWorld(i); const edgeScreen = worldToScreen(edgeCenterWorld.x, edgeCenterWorld.y); drawCtx.beginPath(); drawCtx.arc(edgeScreen.x, edgeScreen.y, CONTROL_POINT_WORLD_SIZE*scale, 0, 2*Math.PI); drawCtx.fill(); }
-        const rotHandleWorld=getRotateHandleWorld();
-        const rotScreen=worldToScreen(rotHandleWorld.x,rotHandleWorld.y);
-        drawCtx.beginPath();
-        drawCtx.arc(rotScreen.x,rotScreen.y, ROTATE_HANDLE_WORLD_SIZE*scale,0,2*Math.PI);
-        drawCtx.fillStyle='#3b82f6';
-        drawCtx.fill();
+
+        function drawPointWithStyle(x, y, radius) {
+            drawCtx.save();
+            drawCtx.shadowBlur = 6;
+            drawCtx.shadowColor = "rgba(0,0,0,0.3)";
+            drawCtx.shadowOffsetX = 1;
+            drawCtx.shadowOffsetY = 1;
+            drawCtx.beginPath();
+            drawCtx.arc(x, y, radius, 0, 2 * Math.PI);
+            drawCtx.fillStyle = '#3b82f6';
+            drawCtx.fill();
+            drawCtx.strokeStyle = 'white';
+            drawCtx.lineWidth = 2;
+            drawCtx.stroke();
+            drawCtx.restore();
+        }
+
+        const controlPointRadius = 8; 
+        for (let pt of screenCorners) {
+            drawPointWithStyle(pt.x, pt.y, controlPointRadius);
+        }
+        for (let i = 0; i < 4; i++) {
+            const edgeCenterWorld = getEdgeCenterWorld(i);
+            const edgeScreen = worldToScreen(edgeCenterWorld.x, edgeCenterWorld.y);
+            drawPointWithStyle(edgeScreen.x, edgeScreen.y, controlPointRadius);
+        }
+
+        const rotHandleWorld = getRotateHandleWorld();
+        const rotScreen = worldToScreen(rotHandleWorld.x, rotHandleWorld.y);
+        const rotateHandleRadius = 18;
+        
         drawCtx.save();
-        drawCtx.translate(rotScreen.x,rotScreen.y);
-        drawCtx.rotate(selectionRotation);
-        drawRotateIcon(drawCtx, ROTATE_ICON_WORLD_SIZE * scale);
+        drawCtx.shadowBlur = 6;
+        drawCtx.shadowColor = "rgba(0,0,0,0.3)";
+        drawCtx.shadowOffsetX = 1;
+        drawCtx.shadowOffsetY = 1;
+        drawCtx.beginPath();
+        drawCtx.arc(rotScreen.x, rotScreen.y, rotateHandleRadius, 0, 2 * Math.PI);
+        drawCtx.fillStyle = '#3b82f6';
+        drawCtx.fill();
+        drawCtx.strokeStyle = 'white';
+        drawCtx.lineWidth = 2;
+        drawCtx.stroke();
         drawCtx.restore();
+
+        drawCtx.save();
+        drawCtx.translate(rotScreen.x, rotScreen.y);
+        drawCtx.rotate(selectionRotation);
+        const rotateIconSize = 24;
+        drawRotateIcon(drawCtx, rotateIconSize);
+        drawCtx.restore();
+
         drawCtx.restore();
     }
-    
+
     function startTransform(type, sx, sy, idx=0){
         isTransforming=true;
         transformType=type;
@@ -1359,7 +1693,7 @@
                 if(st){
                     transformStartSelectedSnapshot.strokes.push({
                         index: idxS,
-                        points: st.points.map(p=>({x:p.x,y:p.y,pressure:p.pressure}))
+                        points: st.points.map(p=>({x:p.x,y:p.y}))
                     });
                 }
             } else if(item[0]==='p'){
@@ -1378,7 +1712,9 @@
         transformStartRotation=selectionRotation;
         if(type==='corner') transformStartCornerIdx=idx;
         if(type==='edge') transformStartEdgeIdx=idx;
+        transformHistoryDirtyScreenRect = getSelectionAndControlsScreenRect();
     }
+    
     function onTransformMove(sx,sy){
         if(!isTransforming) return;
         for(let item of selectedItems){
@@ -1386,7 +1722,7 @@
                 const idxS = parseInt(item.slice(1));
                 const orig = transformStartSelectedSnapshot.strokes.find(s=>s.index===idxS);
                 if(orig){
-                    strokes[idxS].points = orig.points.map(p=>({x:p.x,y:p.y,pressure:p.pressure}));
+                    strokes[idxS].points = orig.points.map(p=>({x:p.x,y:p.y}));
                     updateStrokeBBox(strokes[idxS]);
                 }
             } else if(item[0]==='p'){
@@ -1434,56 +1770,145 @@
             const factor=startProj!==0?curProj/startProj:1;
             applyEdgeScale(fixedEdge,axis,factor);
         }
-        fullRepaint();
-        updatePinsListUI();
+        
+        const currentRect = getSelectionAndControlsScreenRect();
+        if (currentRect) {
+            if (transformHistoryDirtyScreenRect) {
+                const minX = Math.min(transformHistoryDirtyScreenRect.x, currentRect.x);
+                const minY = Math.min(transformHistoryDirtyScreenRect.y, currentRect.y);
+                const maxX = Math.max(transformHistoryDirtyScreenRect.x + transformHistoryDirtyScreenRect.w, currentRect.x + currentRect.w);
+                const maxY = Math.max(transformHistoryDirtyScreenRect.y + transformHistoryDirtyScreenRect.h, currentRect.y + currentRect.h);
+                transformHistoryDirtyScreenRect = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+            } else {
+                transformHistoryDirtyScreenRect = currentRect;
+            }
+            addDirtyRect(transformHistoryDirtyScreenRect);
+        }
+        flushRendering();
     }
-    function endTransform(){
-        if(!isTransforming) return;
+    
+    function endTransform() {
+        if (!isTransforming) return;
         const strokeMods = [];
         const pinMods = [];
-        for(let item of selectedItems){
-            if(item[0]==='s'){
+        let dirtyWorldRect = null;
+
+        for (let item of selectedItems) {
+            if (item[0] === 's') {
                 const idxS = parseInt(item.slice(1));
-                const orig = transformStartSelectedSnapshot.strokes.find(s=>s.index===idxS);
-                if(orig){
-                    const currentPoints = strokes[idxS].points.map(p=>({x:p.x,y:p.y,pressure:p.pressure}));
-                    if(JSON.stringify(orig.points) !== JSON.stringify(currentPoints)){
+                const orig = transformStartSelectedSnapshot.strokes.find(s => s.index === idxS);
+                if (orig) {
+                    const currentPoints = strokes[idxS].points.map(p => ({ x: p.x, y: p.y }));
+                    if (JSON.stringify(orig.points) !== JSON.stringify(currentPoints)) {
                         strokeMods.push({
                             index: idxS,
                             oldPoints: orig.points,
                             newPoints: currentPoints
                         });
+                        const oldStroke = { points: orig.points, worldWidth: strokes[idxS].worldWidth };
+                        updateStrokeBBox(oldStroke);
+                        const newStroke = strokes[idxS];
+                        if (oldStroke.bbox && newStroke.bbox) {
+                            const minX = Math.min(oldStroke.bbox.minX, newStroke.bbox.minX);
+                            const minY = Math.min(oldStroke.bbox.minY, newStroke.bbox.minY);
+                            const maxX = Math.max(oldStroke.bbox.maxX, newStroke.bbox.maxX);
+                            const maxY = Math.max(oldStroke.bbox.maxY, newStroke.bbox.maxY);
+                            if (!dirtyWorldRect) dirtyWorldRect = { minX, minY, maxX, maxY };
+                            else {
+                                dirtyWorldRect.minX = Math.min(dirtyWorldRect.minX, minX);
+                                dirtyWorldRect.minY = Math.min(dirtyWorldRect.minY, minY);
+                                dirtyWorldRect.maxX = Math.max(dirtyWorldRect.maxX, maxX);
+                                dirtyWorldRect.maxY = Math.max(dirtyWorldRect.maxY, maxY);
+                            }
+                        }
                     }
                 }
-            } else if(item[0]==='p'){
+            } else if (item[0] === 'p') {
                 const idxP = parseInt(item.slice(1));
-                const orig = transformStartSelectedSnapshot.pins.find(p=>p.index===idxP);
-                if(orig){
+                const orig = transformStartSelectedSnapshot.pins.find(p => p.index === idxP);
+                if (orig) {
                     const curPin = pins[idxP];
-                    if(orig.x !== curPin.x || orig.y !== curPin.y){
+                    if (orig.x !== curPin.x || orig.y !== curPin.y) {
                         pinMods.push({
                             index: idxP,
                             oldX: orig.x, oldY: orig.y,
                             newX: curPin.x, newY: curPin.y
                         });
+                        const r = PIN_RADIUS_WORLD;
+                        const minX = Math.min(orig.x - r, curPin.x - r);
+                        const minY = Math.min(orig.y - r, curPin.y - r);
+                        const maxX = Math.max(orig.x + r, curPin.x + r);
+                        const maxY = Math.max(orig.y + r, curPin.y + r);
+                        if (!dirtyWorldRect) dirtyWorldRect = { minX, minY, maxX, maxY };
+                        else {
+                            dirtyWorldRect.minX = Math.min(dirtyWorldRect.minX, minX);
+                            dirtyWorldRect.minY = Math.min(dirtyWorldRect.minY, minY);
+                            dirtyWorldRect.maxX = Math.max(dirtyWorldRect.maxX, maxX);
+                            dirtyWorldRect.maxY = Math.max(dirtyWorldRect.maxY, maxY);
+                        }
                     }
                 }
             }
         }
+
         const cmds = [];
-        if(strokeMods.length) cmds.push(new ModifyStrokesCommand(strokeMods));
-        if(pinMods.length) cmds.push(new ModifyPinsCommand(pinMods));
-        if(cmds.length) executeCommand(new CompositeCommand(cmds));
+        if (strokeMods.length) cmds.push(new ModifyStrokesCommand(strokeMods, dirtyWorldRect));
+        if (pinMods.length) cmds.push(new ModifyPinsCommand(pinMods));
+        if (cmds.length) executeCommand(new CompositeCommand(cmds));
+
+        if (transformType === 'rotate') {
+            recomputeSelectionBounds();
+            selectionRotation = 0;
+            addDirtyRectForSelectionAndControls();
+        }
+
+        if (transformHistoryDirtyScreenRect) addDirtyRect(transformHistoryDirtyScreenRect);
+        flushRendering();
+
         isTransforming = false;
         transformType = null;
         transformStartSelectedSnapshot = null;
+        transformHistoryDirtyScreenRect = null;
+        addDirtyRectForSelectionAndControls();
+        flushRendering();
         updatePinsListUI();
         updateBottomPanel();
     }
     
     function getSelectedItemsInsidePolygon(poly){ const items=[]; for(let i=0;i<strokes.length;i++) if(isStrokeSelected(strokes[i],poly)) items.push('s'+i); for(let i=0;i<pins.length;i++) if(pointInPolygon(pins[i].x,pins[i].y,poly)) items.push('p'+i); return items; }
-    function updateSelectionWithModifier(newItems, mod){ if(mod==='add') for(let it of newItems) selectedItems.add(it); else if(mod==='subtract') for(let it of newItems) selectedItems.delete(it); else { selectedItems.clear(); for(let it of newItems) selectedItems.add(it); } if(selectedItems.size===0){ selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionRotation=0; } else { recomputeSelectionBounds(); selectionRotation=0; } fullRepaint(); updateBottomPanel(); }
-    function clearSelection(){ selectedItems.clear(); selectionLocalBounds={x:0,y:0,w:0,h:0}; selectionRotation=0; fullRepaint(); updateBottomPanel(); }
+    
+    function updateSelectionWithModifier(newItems, mod){ 
+        addDirtyRectForSelectionAndControls();
+        if(mod==='add') 
+            for(let it of newItems) selectedItems.add(it); 
+        else if(mod==='subtract') 
+            for(let it of newItems) selectedItems.delete(it); 
+        else { 
+            selectedItems.clear(); 
+            for(let it of newItems) selectedItems.add(it); 
+        } 
+        if(selectedItems.size===0){ 
+            selectionLocalBounds={x:0,y:0,w:0,h:0}; 
+            selectionRotation=0; 
+        } else { 
+            recomputeSelectionBounds(); 
+            selectionRotation=0; 
+        } 
+        addDirtyRectForSelectionAndControls();
+        flushRendering(); 
+        updateBottomPanel(); 
+    }
+    
+    function clearSelection(){ 
+        addDirtyRectForSelectionAndControls();
+        selectedItems.clear(); 
+        selectionLocalBounds={x:0,y:0,w:0,h:0}; 
+        selectionRotation=0; 
+        addDirtyRectForSelectionAndControls();
+        flushRendering(); 
+        updateBottomPanel(); 
+    }
+    
     function deleteSelected(){
         if(selectedItems.size===0) return;
         const toDeleteStrokes = [];
@@ -1519,7 +1944,7 @@
         if (currentEditingPinId !== null) {
             const pin = pins.find(p => p.id === currentEditingPinId);
             if (pin) {
-                bottomPanel.innerHTML = `<button class="bottom-action-btn" id="pinRenameBtn">✏️ 重命名</button><button class="bottom-action-btn" id="pinLevelBtn">📊 等级</button><button class="bottom-action-btn delete-btn" id="pinDeleteBtn">🗑️ 删除</button>`;
+                bottomPanel.innerHTML = `<button class="bottom-action-btn" id="pinRenameBtn">重命名</button><button class="bottom-action-btn" id="pinLevelBtn">等级</button><button class="bottom-action-btn delete-btn" id="pinDeleteBtn">删除</button>`;
                 bottomPanel.classList.add('show');
                 const renameBtn = document.getElementById('pinRenameBtn');
                 const levelBtn = document.getElementById('pinLevelBtn');
@@ -1531,9 +1956,17 @@
             } else { currentEditingPinId = null; }
         }
         if (selectedItems.size > 0 && currentTool !== 'pin') {
-            bottomPanel.innerHTML = `<button class="bottom-action-btn delete-btn" id="deleteSelectedBtn">🗑️ 删除选中</button>`;
+            bottomPanel.innerHTML = `
+                <button class="bottom-action-btn" id="copySelectedBtn">复制</button>
+                <button class="bottom-action-btn" id="pasteBtn">粘贴</button>
+                <button class="bottom-action-btn delete-btn" id="deleteSelectedBtn">删除</button>
+            `;
             bottomPanel.classList.add('show');
+            const copyBtn = document.getElementById('copySelectedBtn');
+            const pasteBtn = document.getElementById('pasteBtn');
             const delBtn = document.getElementById('deleteSelectedBtn');
+            if (copyBtn) copyBtn.onclick = () => copySelected();
+            if (pasteBtn) pasteBtn.onclick = () => paste();
             if (delBtn) delBtn.onclick = () => deleteSelected();
             return;
         }
@@ -1541,17 +1974,60 @@
         bottomPanel.innerHTML = '';
     }
     function showModalRename(pin) { if (isNameModalActive) return; isNameModalActive = true; updateBottomPanel(); const mask = document.createElement('div'); mask.className = 'modal-mask'; document.body.appendChild(mask); modalMask = mask; const panel = document.createElement('div'); panel.className = 'pin-name-modal'; panel.innerHTML = `<input type="text" id="modalRenameInput" value="${escapeHtml(pin.name)}" maxlength="40" autocomplete="off" placeholder="输入图钉名称">`; document.body.appendChild(panel); modalPanel = panel; const input = panel.querySelector('#modalRenameInput'); input.focus(); input.select(); const closeModal = (save) => { if (!isNameModalActive) return; if (save) { const newName = input.value.trim(); if (newName !== "") { const oldPin = JSON.parse(JSON.stringify(pin)); pin.name = newName; const idx = pins.findIndex(p=>p.id===pin.id); if(idx!==-1) executeCommand(new UpdatePinCommand(idx, oldPin, pin)); updatePinsListUI(); fullRepaint(); } } mask.remove(); panel.remove(); modalMask = null; modalPanel = null; isNameModalActive = false; updateBottomPanel(); }; mask.onclick = () => closeModal(true); input.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.stopPropagation(); closeModal(true); } }); const escHandler = (e) => { if (e.key === 'Escape') { e.preventDefault(); closeModal(false); document.removeEventListener('keydown', escHandler); } }; document.addEventListener('keydown', escHandler); panel.addEventListener('click', (e) => e.stopPropagation()); }
-    function openEditPanel(pinId) { const pin = pins.find(p=>p.id===pinId); if(!pin) return; if (isNameModalActive) return; currentEditingPinId = pinId; clearSelection(); updateBottomPanel(); justOpenedPanel = true; setTimeout(()=>{ justOpenedPanel = false; }, 200); fullRepaint(); }
+    
+    function openEditPanel(pinId) { 
+        const newPin = pins.find(p=>p.id===pinId); 
+        if(!newPin) return; 
+        if (isNameModalActive) return;
+        if (currentEditingPinId !== null) {
+            const oldPin = pins.find(p => p.id === currentEditingPinId);
+            if (oldPin) addDirtyRectForPin(oldPin);
+        }
+        currentEditingPinId = pinId; 
+        clearSelection();
+        addDirtyRectForPin(newPin);
+        flushRendering();
+        updateBottomPanel(); 
+        justOpenedPanel = true; 
+        setTimeout(()=>{ justOpenedPanel = false; }, 200); 
+    }
+    
     function showLevelMenu(btn, pinId) { if(currentLevelMenu) currentLevelMenu.remove(); const menu = document.createElement('div'); menu.className = 'level-menu'; const levels = [{ name: "一级", value: 0 },{ name: "二级", value: 1 },{ name: "三级", value: 2 }]; levels.forEach(lv => { const opt = document.createElement('div'); opt.className = 'level-option'; opt.textContent = lv.name; opt.onclick = (e) => { e.stopPropagation(); const pin = pins.find(p=>p.id===pinId); if(pin) { const oldPin = JSON.parse(JSON.stringify(pin)); pin.level = lv.value; const idx = pins.findIndex(p=>p.id===pinId); if(idx!==-1) executeCommand(new UpdatePinCommand(idx, oldPin, pin)); updatePinsListUI(); fullRepaint(); } menu.remove(); if(currentLevelMenu === menu) currentLevelMenu = null; }; menu.appendChild(opt); }); const rect = btn.getBoundingClientRect(); menu.style.left = `${rect.left}px`; menu.style.top = `${rect.bottom + 4}px`; document.body.appendChild(menu); currentLevelMenu = menu; const closeMenu = (e) => { if(menu && !menu.contains(e.target)) { menu.remove(); if(currentLevelMenu===menu) currentLevelMenu=null; document.removeEventListener('click', closeMenu); } }; setTimeout(()=> document.addEventListener('click', closeMenu), 10); }
-    function deleteCurrentPinAndClose() { if(currentEditingPinId===null) return; const idx = pins.findIndex(p=>p.id===currentEditingPinId); if(idx!==-1) { const oldPin = JSON.parse(JSON.stringify(pins[idx])); executeCommand(new DeletePinsCommand([{index: idx, pin: oldPin, wasSelected: false}])); closeEditPanel(); clearSelection(); fullRepaint(); updatePinsListUI(); } }
-    function closeEditPanel() { currentEditingPinId = null; updateBottomPanel(); fullRepaint(); }
-    function placePin(worldX, worldY){ const newId = nextPinId++; const newPin = { id: newId, x: worldX, y: worldY, name: `图钉${newId}`, level: 0 }; executeCommand(new AddPinCommand(newPin, pins.length)); fullRepaint(); updatePinsListUI(); }
+    
+    function deleteCurrentPinAndClose() { 
+        if(currentEditingPinId===null) return; 
+        const idx = pins.findIndex(p=>p.id===currentEditingPinId); 
+        if(idx!==-1) { 
+            const oldPin = JSON.parse(JSON.stringify(pins[idx])); 
+            addDirtyRectForPin(pins[idx]);
+            executeCommand(new DeletePinsCommand([{index: idx, pin: oldPin, wasSelected: false}])); 
+            closeEditPanel(); 
+            clearSelection(); 
+            updatePinsListUI(); 
+        } 
+    }
+    
+    function closeEditPanel() {
+        if (currentEditingPinId === null) return;
+        const pin = pins.find(p => p.id === currentEditingPinId);
+        if (pin) addDirtyRectForPin(pin);
+        currentEditingPinId = null;
+        flushRendering();
+        updateBottomPanel();
+    }
+    
+    function placePin(worldX, worldY){ 
+        const newId = nextPinId++; 
+        const newPin = { id: newId, x: worldX, y: worldY, name: `图钉${newId}`, level: 0 }; 
+        executeCommand(new AddPinCommand(newPin, pins.length)); 
+        updatePinsListUI(); 
+    }
     function updatePinsListUI() { if(!pinListContainer) return; pinListContainer.innerHTML = ''; if(pins.length===0){ pinListContainer.innerHTML='<div class="empty-pins">暂无图钉<br>点击 📌 放置图钉</div>'; return; } pins.forEach(pin=>{ const div=document.createElement('div'); div.className='pin-item'; const info=document.createElement('div'); info.className='pin-info'; info.style.paddingLeft=`${pin.level*16}px`; info.innerHTML=`<span class="pin-icon">📌</span><span class="pin-name">${escapeHtml(pin.name)}</span><span class="pin-level-badge">${pin.level===0?'一级':(pin.level===1?'二级':'三级')}</span>`; div.appendChild(info); div.addEventListener('click',()=>focusOnPin(pin.x,pin.y)); pinListContainer.appendChild(div); }); }
     function escapeHtml(str){ return str.replace(/[&<>]/g, m=> m==='&'?'&amp;':m==='<'?'&lt;':'&gt;'); }
     
-    function addPointWithSmoothingAndInterp(rawX, rawY, pressure) {
+    function addPointWithSmoothingAndInterp(rawX, rawY) {
         if (!currentStroke) return;
-        const raw = { x: rawX, y: rawY, pressure: Math.min(1, Math.max(0, pressure)) };
+        const raw = { x: rawX, y: rawY };
         currentStroke.rawPoints.push(raw);
         const newSmoothed = regenerateSmoothedPoints(currentStroke.rawPoints, smoothFactor);
         currentStroke.points = newSmoothed;
@@ -1565,19 +2041,16 @@
         }
     }
     
-    function startStroke(worldX, worldY, toolType, width, pressure = 0.5) {
+    function startStroke(worldX, worldY, toolType, width) {
         if (shapeRecogTimer) { clearTimeout(shapeRecogTimer); shapeRecogTimer = null; }
         strokeModifiedByRecog = false;
-        const rawPoint = { x: worldX, y: worldY, pressure: Math.min(1, Math.max(0, pressure)) };
+        const rawPoint = { x: worldX, y: worldY };
         currentStroke = {
             type: toolType,
-            baseWidth: width,   // 基准宽度（滑块值）
+            worldWidth: width,
             rawPoints: [rawPoint],
             points: [rawPoint]
         };
-        if (toolType === 'eraser') {
-            currentStroke.worldWidth = width;   // 橡皮擦固定宽度
-        }
         isDrawing = true;
         const bounds = getStrokeScreenBounds(currentStroke);
         if (bounds) addDirtyRect(bounds);
@@ -1585,14 +2058,130 @@
         updateCursorVisibility();
     }
     
-    function startLasso(worldX,worldY,modifier){ lassoModifier=modifier; if(modifier==='replace') clearSelection(); isLassoDrawing=true; lassoPoints=[{x:worldX,y:worldY}]; fullRepaint(); updateCursorVisibility(); }
-    function addLassoPoint(worldX,worldY){ if(!isLassoDrawing) return; lassoPoints.push({x:worldX,y:worldY}); fullRepaint(); }
-    function finalizeLasso(){ if(lassoPoints.length<3){ isLassoDrawing=false; lassoPoints=[]; fullRepaint(); return; } const inside = getSelectedItemsInsidePolygon(lassoPoints); updateSelectionWithModifier(inside, lassoModifier); isLassoDrawing=false; lassoPoints=[]; fullRepaint(); }
+    function startLasso(worldX,worldY,modifier){ 
+        lassoModifier=modifier; 
+        if(modifier==='replace') clearSelection(); 
+        isLassoDrawing=true; 
+        lassoPoints=[{x:worldX,y:worldY}]; 
+        addDirtyRectForLasso();
+        flushRendering(); 
+        updateCursorVisibility(); 
+    }
+    function addLassoPoint(worldX,worldY){ 
+        if(!isLassoDrawing) return; 
+        const oldBounds = getLassoScreenBounds();
+        lassoPoints.push({x:worldX,y:worldY});
+        const newBounds = getLassoScreenBounds();
+        if (oldBounds && newBounds) {
+            const mergedRect = {
+                x: Math.min(oldBounds.x, newBounds.x),
+                y: Math.min(oldBounds.y, newBounds.y),
+                w: Math.max(oldBounds.x + oldBounds.w, newBounds.x + newBounds.w) - Math.min(oldBounds.x, newBounds.x),
+                h: Math.max(oldBounds.y + oldBounds.h, newBounds.y + newBounds.h) - Math.min(oldBounds.y, newBounds.y)
+            };
+            addDirtyRect(mergedRect);
+        } else if (newBounds) {
+            addDirtyRect(newBounds);
+        }
+        flushRendering();
+    }
+    function finalizeLasso(){ 
+        if(lassoPoints.length < 3){ 
+            isLassoDrawing = false; 
+            const oldPoints = lassoPoints.slice();
+            lassoPoints = []; 
+            if (oldPoints.length >= 2) {
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                for (let p of oldPoints) {
+                    const sp = worldToScreen(p.x, p.y);
+                    minX = Math.min(minX, sp.x);
+                    minY = Math.min(minY, sp.y);
+                    maxX = Math.max(maxX, sp.x);
+                    maxY = Math.max(maxY, sp.y);
+                }
+                const extend = 4;
+                if (minX !== Infinity) {
+                    const rect = {
+                        x: Math.floor(minX - extend),
+                        y: Math.floor(minY - extend),
+                        w: Math.ceil(maxX - minX + extend * 2),
+                        h: Math.ceil(maxY - minY + extend * 2)
+                    };
+                    if (rect.w > 0 && rect.h > 0) addDirtyRect(rect);
+                }
+            }
+            flushRendering(); 
+            return; 
+        } 
+        const currentLassoPoints = lassoPoints.slice();
+        const currentModifier = lassoModifier;
+        isLassoDrawing = false;
+        lassoPoints = [];
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let p of currentLassoPoints) {
+            const sp = worldToScreen(p.x, p.y);
+            minX = Math.min(minX, sp.x);
+            minY = Math.min(minY, sp.y);
+            maxX = Math.max(maxX, sp.x);
+            maxY = Math.max(maxY, sp.y);
+        }
+        const extend = 4;
+        if (minX !== Infinity) {
+            const rect = {
+                x: Math.floor(minX - extend),
+                y: Math.floor(minY - extend),
+                w: Math.ceil(maxX - minX + extend * 2),
+                h: Math.ceil(maxY - minY + extend * 2)
+            };
+            if (rect.w > 0 && rect.h > 0) addDirtyRect(rect);
+        }
+        flushRendering();
+        const inside = getSelectedItemsInsidePolygon(currentLassoPoints); 
+        updateSelectionWithModifier(inside, currentModifier);
+    }
     function getCurrentWorldWidth(){ return currentTool==='pencil'?pencilWorldWidth:(currentTool==='eraser'?eraserWorldWidth:4); }
     function updateBrushPanelUI(){ if(currentTool==='pencil'){ brushLabel.textContent='笔刷粗细'; brushSlider.value=pencilWorldWidth; brushValue.textContent=pencilWorldWidth; brushPanelEl.classList.remove('show'); } else if(currentTool==='eraser'){ brushLabel.textContent='橡皮粗细'; brushSlider.value=eraserWorldWidth; brushValue.textContent=eraserWorldWidth; brushPanelEl.classList.remove('show'); } else brushPanelEl.classList.remove('show'); }
     function setCurrentWorldWidthFromSlider(v){ const w=parseInt(v,10); if(currentTool==='pencil') pencilWorldWidth=w; else if(currentTool==='eraser') eraserWorldWidth=w; brushSlider.value=w; brushValue.textContent=w; updateCursorSize(); }
     function showBrushPanelRelativeToButton(btn){ if(!btn) return; const toolbarRect = document.querySelector('.toolbar').getBoundingClientRect(); const btnRect = btn.getBoundingClientRect(); brushPanelEl.style.left = (toolbarRect.right + 12) + 'px'; brushPanelEl.style.top = (btnRect.top + btnRect.height/2) + 'px'; brushPanelEl.style.transform = 'translateY(-50%)'; brushPanelEl.classList.add('show'); }
-    function setTool(tool,showPanel=false,srcBtn=null){ if(tool===currentTool&&!showPanel) return; if(isNameModalActive) return; clearSelection(); if(isLassoDrawing){ isLassoDrawing=false; lassoPoints=[]; fullRepaint(); } closeEditPanel(); currentTool=tool; pencilBtn.classList.remove('active'); eraserBtn.classList.remove('active'); lassoBtn.classList.remove('active'); pinBtn.classList.remove('active','pin-active'); customCursor.classList.remove('pencil-mode','eraser-mode','lasso-mode','pin-mode'); if(tool==='pencil'){ pencilBtn.classList.add('active'); customCursor.classList.add('pencil-mode'); } else if(tool==='eraser'){ eraserBtn.classList.add('active'); customCursor.classList.add('eraser-mode'); } else if(tool==='lasso'){ lassoBtn.classList.add('active'); customCursor.classList.add('lasso-mode'); } else if(tool==='pin'){ pinBtn.classList.add('active','pin-active'); customCursor.classList.add('pin-mode'); } updateBrushPanelUI(); if(showPanel&&(tool==='pencil'||tool==='eraser')){ const btn=srcBtn||(tool==='pencil'?pencilBtn:eraserBtn); showBrushPanelRelativeToButton(btn); } else brushPanelEl.classList.remove('show'); updateCursorSize(); if(!isPanning&&!isDrawing&&!isLassoDrawing) updateCursorVisibility(); updateBottomPanel(); fullRepaint(); }
+    function setTool(tool,showPanel=false,srcBtn=null){ 
+        if(tool===currentTool&&!showPanel) return; 
+        if(isNameModalActive) return; 
+        clearSelection(); 
+        if(isLassoDrawing){ 
+            addDirtyRectForLasso();
+            isLassoDrawing=false; 
+            lassoPoints=[]; 
+            flushRendering();
+        } 
+        closeEditPanel(); 
+        currentTool=tool; 
+        pencilBtn.classList.remove('active'); 
+        eraserBtn.classList.remove('active'); 
+        lassoBtn.classList.remove('active'); 
+        pinBtn.classList.remove('active','pin-active'); 
+        customCursor.classList.remove('pencil-mode','eraser-mode','lasso-mode','pin-mode'); 
+        if(tool==='pencil'){ 
+            pencilBtn.classList.add('active'); 
+            customCursor.classList.add('pencil-mode'); 
+        } else if(tool==='eraser'){ 
+            eraserBtn.classList.add('active'); 
+            customCursor.classList.add('eraser-mode'); 
+        } else if(tool==='lasso'){ 
+            lassoBtn.classList.add('active'); 
+            customCursor.classList.add('lasso-mode'); 
+        } else if(tool==='pin'){ 
+            pinBtn.classList.add('active','pin-active'); 
+            customCursor.classList.add('pin-mode'); 
+        } 
+        updateBrushPanelUI(); 
+        if(showPanel&&(tool==='pencil'||tool==='eraser')){ 
+            const btn=srcBtn||(tool==='pencil'?pencilBtn:eraserBtn); 
+            showBrushPanelRelativeToButton(btn); 
+        } else brushPanelEl.classList.remove('show'); 
+        updateCursorSize(); 
+        if(!isPanning&&!isDrawing&&!isLassoDrawing) updateCursorVisibility(); 
+        updateBottomPanel(); 
+    }
     function hideBrushPanel(){ brushPanelEl.classList.remove('show'); }
     function updateZoomDisplay(){ zoomSpan.textContent=`${Math.round(scale*100)}%`; }
     function panView(dx,dy){ 
@@ -1603,6 +2192,7 @@
         markCacheDirty();
         fullRender(); updateZoomDisplay(); updateCursorSize();
     }
+    
     function zoomAtScreen(sx,sy,delta){
         let ns = scale * delta;
         ns = Math.min(Math.max(ns, MIN_SCALE), MAX_SCALE);
@@ -1615,6 +2205,7 @@
         fullRender();
         updateZoomDisplay();
         updateCursorSize();
+        scheduleZoomEnd(); 
     }
     function maintainCenterOnResize(){
         const prevCenter = screenToWorld(canvasWidth/2, canvasHeight/2);
@@ -1637,55 +2228,28 @@
         fullRender();
     }
     function updateCursorSize(){ if(currentTool==='lasso'){ customCursor.style.width='24px'; customCursor.style.height='24px'; return; } if(currentTool==='pin'){ customCursor.style.width='28px'; customCursor.style.height='28px'; return; } const w=getCurrentWorldWidth(); const d=Math.max(8,w*scale); customCursor.style.width=`${d}px`; customCursor.style.height=`${d}px`; }
-    function saveCanvas(){ 
-        const saveStrokes = strokes.filter(s => s.type !== 'eraser');
-        const data={
-            version:"2.1",  // 版本升级，支持压力
-            view:{offsetX,offsetY,scale},
-            strokes:saveStrokes.map(s=>({
-                type:s.type,
-                baseWidth:s.baseWidth,
-                points:s.points.map(p=>({x:p.x,y:p.y,pressure:p.pressure}))
-            })),
-            pins:pins.map(p=>({id:p.id,x:p.x,y:p.y,name:p.name,level:p.level}))
-        };
-        const json=JSON.stringify(data,null,2); const blob=new Blob([json],{type:"application/json"}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`canvas_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.infcanvas`; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); 
-    }
-    function importCanvas(file){ 
-        const reader=new FileReader(); 
-        reader.onload=e=>{ 
-            try{ 
-                const data=JSON.parse(e.target.result); 
-                let newStrokes = [], newPins = []; 
-                if(data.strokes && Array.isArray(data.strokes)) newStrokes=data.strokes.filter(s=>s.type==='pencil'||s.type==='pointcloud').map(s=>{ 
-                    const points = s.points.map(p=>{
-                        let pressure = (p.pressure !== undefined) ? p.pressure : 0.5;
-                        return { x:p.x, y:p.y, pressure };
-                    });
-                    const st={
-                        type:(s.type==='pointcloud'?'pencil':s.type),
-                        baseWidth: s.baseWidth !== undefined ? s.baseWidth : (s.worldWidth || 4),
-                        points: points
-                    };
-                    updateStrokeBBox(st);
-                    return st;
-                });
-                if(data.pins && Array.isArray(data.pins)) newPins=data.pins.map(p=>({id:p.id??(nextPinId++),x:p.x,y:p.y,name:p.name??`图钉${p.id}`,level:p.level??0}));
-                let newOffsetX=offsetX, newOffsetY=offsetY, newScale=scale;
-                if(data.view){ newOffsetX=data.view.offsetX??offsetX; newOffsetY=data.view.offsetY??offsetY; let ns=data.view.scale??scale; ns=Math.min(Math.max(ns,MIN_SCALE),MAX_SCALE); newScale=ns; }
-                const cmd = new ReplaceAllCommand(strokes, pins, newStrokes, newPins);
-                executeCommand(cmd);
-                offsetX = newOffsetX; offsetY = newOffsetY; scale = newScale;
-                if(currentStroke){ currentStroke=null; isDrawing=false; }
-                markCacheDirty();
-                clearSelection();
-                fullRender();
-                updateZoomDisplay();
-                updateCursorSize();
-                updatePinsListUI();
-            }catch(err){ alert("导入失败"); } 
-        }; reader.readAsText(file); 
-    }
+    function saveCanvas(){ const saveStrokes = strokes.filter(s => s.type !== 'eraser');
+        const data={version:"2.0",view:{offsetX,offsetY,scale},strokes:saveStrokes.map(s=>({type:s.type,worldWidth:s.worldWidth,points:s.points.map(p=>({x:p.x,y:p.y}))})), pins:pins.map(p=>({id:p.id,x:p.x,y:p.y,name:p.name,level:p.level}))};
+        const json=JSON.stringify(data,null,2); const blob=new Blob([json],{type:"application/json"}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`canvas_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.infcanvas`; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }
+    function importCanvas(file){ const reader=new FileReader(); reader.onload=e=>{ try{ const data=JSON.parse(e.target.result); let newStrokes = [], newPins = []; if(data.strokes && Array.isArray(data.strokes)) newStrokes=data.strokes.filter(s=>s.type==='pencil'||s.type==='pointcloud').map(s=>{ 
+            const st={type:(s.type==='pointcloud'?'pencil':s.type),worldWidth:s.worldWidth,points:s.points.map(p=>({x:p.x,y:p.y}))};
+            updateStrokeBBox(st);
+            return st;
+        });
+        if(data.pins && Array.isArray(data.pins)) newPins=data.pins.map(p=>({id:p.id??(nextPinId++),x:p.x,y:p.y,name:p.name??`图钉${p.id}`,level:p.level??0}));
+        let newOffsetX=offsetX, newOffsetY=offsetY, newScale=scale;
+        if(data.view){ newOffsetX=data.view.offsetX??offsetX; newOffsetY=data.view.offsetY??offsetY; let ns=data.view.scale??scale; ns=Math.min(Math.max(ns,MIN_SCALE),MAX_SCALE); newScale=ns; }
+        const cmd = new ReplaceAllCommand(strokes, pins, newStrokes, newPins);
+        executeCommand(cmd);
+        offsetX = newOffsetX; offsetY = newOffsetY; scale = newScale;
+        if(currentStroke){ currentStroke=null; isDrawing=false; }
+        markCacheDirty();
+        clearSelection();
+        fullRender();
+        updateZoomDisplay();
+        updateCursorSize();
+        updatePinsListUI();
+        }catch(err){ alert("导入失败"); } }; reader.readAsText(file); }
     function triggerImport(){ fileInput.click(); }
     function onFileSelected(e){ const file=e.target.files[0]; if(file) importCanvas(file); fileInput.value=''; }
     function updateCursorVisibility(){ if(isNameModalActive){ customCursor.style.display='none'; return; } if(isDrawing||isPanning||isLassoDrawing||isTransforming){ customCursor.style.display='block'; return; } const hover=document.elementFromPoint(lastMouseScreenX/dpr, lastMouseScreenY/dpr); const uiElements=[document.querySelector('.toolbar'), brushPanelEl, document.querySelector('.smooth-container'), document.querySelector('.panel'), bottomPanel]; let onUI=false; for(let ui of uiElements) if(ui&&ui.contains(hover)){ onUI=true; break; } customCursor.style.display=onUI?'none':'block'; }
@@ -1708,159 +2272,117 @@
         if (cssX < 0 || cssX > window.innerWidth || cssY < 0 || cssY > window.innerHeight) return null;
         return { x: cssX * dpr, y: cssY * dpr };
     }
-    function onPointerDown(e){ 
-        if(isNameModalActive) return; 
-        e.preventDefault(); 
-        drawingCanvas.setPointerCapture(e.pointerId); 
-        const rect=drawingCanvas.getBoundingClientRect(); 
-        const coords=getCanvasCoordsFromEvent(e,rect); 
-        if(!coords) return; 
-        const {x:sx,y:sy}=coords; 
-        lastMouseScreenX=sx; lastMouseScreenY=sy; 
-        pointerDownScreen={x:sx,y:sy}; 
-        const world=screenToWorld(sx,sy); 
-        if((spacePressed&&e.button===0)||e.button===2){ 
-            if(isDrawing) finalizeCurrentStroke(); 
-            if(isLassoDrawing) finalizeLasso(); 
-            cancelTransform(); 
-            isPanning=true; 
-            activePointerId=e.pointerId; 
-            lastPanX=sx; lastPanY=sy; 
-            drawingCanvas.style.cursor='grabbing'; 
-            updateCursorVisibility(); 
-            return; 
-        } 
-        if(currentTool==='lasso'){ 
-            const hit = hitTestTransformControls(sx, sy); 
-            if(hit && selectedItems.size>0){ 
-                if(hit.type==='move') startTransform('move',sx,sy); 
-                else if(hit.type==='corner') startTransform('corner',sx,sy,hit.index); 
-                else if(hit.type==='edge') startTransform('edge',sx,sy,hit.index); 
-                else if(hit.type==='rotate') startTransform('rotate',sx,sy); 
-                activePointerId=e.pointerId; 
-                return; 
-            } 
-            let mod='replace'; 
-            if(e.shiftKey) mod='add'; 
-            else if(e.altKey) mod='subtract'; 
-            startLasso(world.x,world.y,mod); 
-            activePointerId=e.pointerId; 
-            return; 
-        } 
-        if(currentTool==='pin'){ 
-            const wasPanelOpen = bottomPanel.classList.contains('show') && currentEditingPinId !== null; 
-            let clickedPin = getPinByWorldClick(world.x, world.y); 
-            if(wasPanelOpen){ 
-                const wasEditingId = currentEditingPinId; 
-                closeEditPanel(); 
-                if(clickedPin && clickedPin.pin.id === wasEditingId) return; 
-            } 
-            if(clickedPin){ 
-                openEditPanel(clickedPin.pin.id); 
-                return; 
-            } 
-            if(!wasPanelOpen) placePin(world.x, world.y); 
-            return; 
-        } 
-        if(e.button===0&&!isPanning){ 
-            if(isDrawing) return; 
-            if(isLassoDrawing) finalizeLasso(); 
-            cancelTransform(); 
-            const pressure = e.pressure !== undefined ? e.pressure : 0.5;
-            startStroke(world.x,world.y,currentTool,getCurrentWorldWidth(), pressure); 
-            activePointerId=e.pointerId; 
-        } 
+    
+    function onPointerDown(e) {
+    if (isNameModalActive) return;
+    e.preventDefault();
+    drawingCanvas.setPointerCapture(e.pointerId);
+    const rect = drawingCanvas.getBoundingClientRect();
+    const coords = getCanvasCoordsFromEvent(e, rect);
+    if (!coords) return;
+    const { x: sx, y: sy } = coords;
+    lastMouseScreenX = sx;
+    lastMouseScreenY = sy;
+    pointerDownScreen = { x: sx, y: sy };
+    const world = screenToWorld(sx, sy);
+
+    // 1. 优先处理平移（空格+左键 或 右键）
+    if ((spacePressed && e.button === 0) || e.button === 2) {
+        if (isDrawing) finalizeCurrentStroke();
+        if (isLassoDrawing) finalizeLasso();
+        cancelTransform();
+        isPanning = true;
+        activePointerId = e.pointerId;
+        lastPanX = sx;
+        lastPanY = sy;
+        drawingCanvas.style.cursor = 'grabbing';
+        updateCursorVisibility();
+        return;
     }
-    function onPointerMove(e){ 
-        if(isNameModalActive) return; 
-        const rect=drawingCanvas.getBoundingClientRect(); 
-        const coords=getCanvasCoordsFromEvent(e,rect); 
-        if(coords){ 
-            lastMouseScreenX=coords.x; lastMouseScreenY=coords.y; 
-            coordsCache=coords; 
-        } 
-        if(isPanning&&activePointerId===e.pointerId&&coords){ 
-            const dx=coords.x-lastPanX, dy=coords.y-lastPanY; 
-            if(dx!==0||dy!==0) panView(dx,dy); 
-            lastPanX=coords.x; lastPanY=coords.y; 
-            if(coords) moveCursor(coords.x,coords.y); 
-            return; 
-        } 
-        if(isTransforming&&activePointerId===e.pointerId&&coords){ 
-            onTransformMove(coords.x,coords.y); 
-            return; 
-        } 
-        if(coords){ 
-            moveCursor(coords.x,coords.y); 
-            if(!isDrawing&&!isPanning&&!isLassoDrawing&&!isTransforming) updateCursorVisibility(); 
-        } 
-        if(isDrawing&&activePointerId===e.pointerId&&currentStroke&&coords){ 
-            const w=screenToWorld(coords.x,coords.y); 
-            const pressure = e.pressure !== undefined ? e.pressure : 0.5;
-            addPointWithSmoothingAndInterp(w.x,w.y, pressure); 
-        } 
-        if(isLassoDrawing&&activePointerId===e.pointerId&&coords){ 
-            const w=screenToWorld(coords.x,coords.y); 
-            addLassoPoint(w.x,w.y); 
-        } 
+
+    // 2. 套索工具下的 Shift/Alt：直接进入套索多选/减选（不进入变换）
+    const isShiftPressed = e.shiftKey;
+    const isAltPressed = e.altKey;
+    if (currentTool === 'lasso' && (isShiftPressed || isAltPressed)) {
+        let mod = 'replace';
+        if (isShiftPressed) mod = 'add';
+        else if (isAltPressed) mod = 'subtract';
+        startLasso(world.x, world.y, mod);
+        activePointerId = e.pointerId;
+        return;
     }
-    function onPointerUp(e){ 
-        if(isNameModalActive) return; 
-        e.preventDefault(); 
-        drawingCanvas.releasePointerCapture(e.pointerId); 
-        if(shapeRecogTimer){ clearTimeout(shapeRecogTimer); shapeRecogTimer=null; } 
-        if(isPanning&&activePointerId===e.pointerId){ 
-            isPanning=false; 
-            activePointerId=null; 
-            drawingCanvas.style.cursor='none'; 
-            updateCursorVisibility(); 
-            return; 
-        } 
-        if(isTransforming&&activePointerId===e.pointerId){ 
-            endTransform(); 
-            activePointerId=null; 
-            drawingCanvas.style.cursor='none'; 
-            updateCursorVisibility(); 
-            return; 
-        } 
-        if(isDrawing&&activePointerId===e.pointerId){ 
-            finalizeCurrentStroke(); 
-            activePointerId=null; 
-            isDrawing=false; 
-            updateCursorVisibility(); 
-            return; 
-        } 
-        if(isLassoDrawing&&activePointerId===e.pointerId){ 
-            finalizeLasso(); 
-            activePointerId=null; 
-            isLassoDrawing=false; 
-            updateCursorVisibility(); 
-            return; 
-        } 
-        if(currentTool==='lasso'&&!isLassoDrawing&&!isTransforming&&pointerDownScreen&&coordsCache){ 
-            const dx=coordsCache.x-pointerDownScreen.x, dy=coordsCache.y-pointerDownScreen.y; 
-            if(Math.hypot(dx,dy)<5) clearSelection(); 
-        } 
-        pointerDownScreen=null; coordsCache=null; 
+
+    // 3. 通用变换：任何工具下，如果命中选中的对象，则启动移动/缩放/旋转
+    //    但套索工具下且按下修饰键的情况已经在上一步处理，这里不再命中
+    if (!isDrawing && !isLassoDrawing && !isPanning && !isTransforming && selectedItems.size > 0) {
+        const hit = hitTestTransformControls(sx, sy);
+        if (hit) {
+            if (hit.type === 'move') startTransform('move', sx, sy);
+            else if (hit.type === 'corner') startTransform('corner', sx, sy, hit.index);
+            else if (hit.type === 'edge') startTransform('edge', sx, sy, hit.index);
+            else if (hit.type === 'rotate') startTransform('rotate', sx, sy);
+            activePointerId = e.pointerId;
+            return;
+        }
     }
-    function onPointerCancel(e){ 
-        if(isNameModalActive) return; 
-        if(shapeRecogTimer){ clearTimeout(shapeRecogTimer); shapeRecogTimer=null; } 
-        if(isDrawing&&activePointerId===e.pointerId) finalizeCurrentStroke(); 
-        if(isLassoDrawing&&activePointerId===e.pointerId) finalizeLasso(); 
-        if(isPanning&&activePointerId===e.pointerId) isPanning=false; 
-        if(isTransforming&&activePointerId===e.pointerId) cancelTransform(); 
-        activePointerId=null; 
-        pointerDownScreen=null; 
-        coordsCache=null; 
+
+    // 4. 点击空白区域：清除选中
+    //    对于铅笔/橡皮/图钉工具，清除选中后直接返回，不执行工具操作
+    //    对于套索工具，清除选中后继续执行套索绘制（如果没有按修饰键）
+    if (selectedItems.size > 0) {
+        clearSelection();
+        if (currentTool !== 'lasso') {
+            return;
+        }
+        // 套索工具：清除选中后继续往下走，开始新套索（不加修饰键）
     }
+
+    // 5. 根据当前工具执行原生操作
+    if (currentTool === 'lasso') {
+        let mod = 'replace';
+        if (isShiftPressed) mod = 'add';
+        else if (isAltPressed) mod = 'subtract';
+        startLasso(world.x, world.y, mod);
+        activePointerId = e.pointerId;
+        return;
+    }
+
+    if (currentTool === 'pin') {
+        const wasPanelOpen = bottomPanel.classList.contains('show') && currentEditingPinId !== null;
+        let clickedPin = getPinByWorldClick(world.x, world.y);
+        if (wasPanelOpen) {
+            const wasEditingId = currentEditingPinId;
+            closeEditPanel();
+            if (clickedPin && clickedPin.pin.id === wasEditingId) return;
+        }
+        if (clickedPin) {
+            openEditPanel(clickedPin.pin.id);
+            return;
+        }
+        if (!wasPanelOpen) placePin(world.x, world.y);
+        return;
+    }
+
+    // 铅笔 / 橡皮
+    if (e.button === 0 && !isPanning) {
+        if (isDrawing) return;
+        if (isLassoDrawing) finalizeLasso();
+        cancelTransform();
+        startStroke(world.x, world.y, currentTool, getCurrentWorldWidth());
+        activePointerId = e.pointerId;
+    }
+}
+    
+    function onPointerMove(e){ if(isNameModalActive) return; const rect=drawingCanvas.getBoundingClientRect(); const coords=getCanvasCoordsFromEvent(e,rect); if(coords){ lastMouseScreenX=coords.x; lastMouseScreenY=coords.y; coordsCache=coords; } if(isPanning&&activePointerId===e.pointerId&&coords){ const dx=coords.x-lastPanX, dy=coords.y-lastPanY; if(dx!==0||dy!==0) panView(dx,dy); lastPanX=coords.x; lastPanY=coords.y; if(coords) moveCursor(coords.x,coords.y); return; } if(isTransforming&&activePointerId===e.pointerId&&coords){ onTransformMove(coords.x,coords.y); return; } if(coords){ moveCursor(coords.x,coords.y); if(!isDrawing&&!isPanning&&!isLassoDrawing&&!isTransforming) updateCursorVisibility(); } if(isDrawing&&activePointerId===e.pointerId&&currentStroke&&coords){ const w=screenToWorld(coords.x,coords.y); addPointWithSmoothingAndInterp(w.x,w.y); } if(isLassoDrawing&&activePointerId===e.pointerId&&coords){ const w=screenToWorld(coords.x,coords.y); addLassoPoint(w.x,w.y); } }
+    function onPointerUp(e){ if(isNameModalActive) return; e.preventDefault(); drawingCanvas.releasePointerCapture(e.pointerId); if(shapeRecogTimer){ clearTimeout(shapeRecogTimer); shapeRecogTimer=null; } if(isPanning&&activePointerId===e.pointerId){ isPanning=false; activePointerId=null; drawingCanvas.style.cursor='none'; updateCursorVisibility(); return; } if(isTransforming&&activePointerId===e.pointerId){ endTransform(); activePointerId=null; drawingCanvas.style.cursor='none'; updateCursorVisibility(); return; } if(isDrawing&&activePointerId===e.pointerId){ finalizeCurrentStroke(); activePointerId=null; isDrawing=false; updateCursorVisibility(); return; } if(isLassoDrawing&&activePointerId===e.pointerId){ finalizeLasso(); activePointerId=null; isLassoDrawing=false; updateCursorVisibility(); return; } if(currentTool==='lasso'&&!isLassoDrawing&&!isTransforming&&pointerDownScreen&&coordsCache){ const dx=coordsCache.x-pointerDownScreen.x, dy=coordsCache.y-pointerDownScreen.y; if(Math.hypot(dx,dy)<5) clearSelection(); } pointerDownScreen=null; coordsCache=null; }
+    function onPointerCancel(e){ if(isNameModalActive) return; if(shapeRecogTimer){ clearTimeout(shapeRecogTimer); shapeRecogTimer=null; } if(isDrawing&&activePointerId===e.pointerId) finalizeCurrentStroke(); if(isLassoDrawing&&activePointerId===e.pointerId) finalizeLasso(); if(isPanning&&activePointerId===e.pointerId) isPanning=false; if(isTransforming&&activePointerId===e.pointerId) cancelTransform(); activePointerId=null; pointerDownScreen=null; coordsCache=null; }
     function cancelTransform(){ if(isTransforming && transformStartSelectedSnapshot){
         for(let item of selectedItems){
             if(item[0]==='s'){
                 const idxS = parseInt(item.slice(1));
                 const orig = transformStartSelectedSnapshot.strokes.find(s=>s.index===idxS);
                 if(orig){
-                    strokes[idxS].points = orig.points.map(p=>({x:p.x,y:p.y,pressure:p.pressure}));
+                    strokes[idxS].points = orig.points.map(p=>({x:p.x,y:p.y}));
                     updateStrokeBBox(strokes[idxS]);
                 }
             } else if(item[0]==='p'){
@@ -1891,6 +2413,156 @@
             updateCursorVisibility();
         }
     } }
+    
+    // ========== 复制粘贴功能 ==========
+    function copySelected() {
+        if (selectedItems.size === 0) return;
+        copyBuffer.strokes = [];
+        copyBuffer.pins = [];
+        for (let item of selectedItems) {
+            if (item[0] === 's') {
+                const idx = parseInt(item.slice(1));
+                const st = strokes[idx];
+                if (st && st.type === 'pencil') {
+                    copyBuffer.strokes.push({
+                        type: st.type,
+                        worldWidth: st.worldWidth,
+                        points: st.points.map(p => ({ x: p.x, y: p.y }))
+                    });
+                }
+            } else if (item[0] === 'p') {
+                const idx = parseInt(item.slice(1));
+                const pin = pins[idx];
+                if (pin) {
+                    copyBuffer.pins.push({
+                        x: pin.x,
+                        y: pin.y,
+                        name: pin.name,
+                        level: pin.level
+                    });
+                }
+            }
+        }
+    }
+
+    function paste() {
+        if (copyBuffer.strokes.length === 0 && copyBuffer.pins.length === 0) return;
+        
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let st of copyBuffer.strokes) {
+            for (let p of st.points) {
+                if (p.x < minX) minX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y > maxY) maxY = p.y;
+            }
+        }
+        for (let pin of copyBuffer.pins) {
+            if (pin.x < minX) minX = pin.x;
+            if (pin.y < minY) minY = pin.y;
+            if (pin.x > maxX) maxX = pin.x;
+            if (pin.y > maxY) maxY = pin.y;
+        }
+        if (minX === Infinity) return;
+        
+        const clipboardCenter = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+        const screenCenterScreen = { x: canvasWidth / 2, y: canvasHeight / 2 };
+        const screenCenterWorld = screenToWorld(screenCenterScreen.x, screenCenterScreen.y);
+        const offsetXWorld = screenCenterWorld.x - clipboardCenter.x;
+        const offsetYWorld = screenCenterWorld.y - clipboardCenter.y;
+        
+        const newStrokes = [];
+        const newPins = [];
+        let worldMinX = Infinity, worldMinY = Infinity, worldMaxX = -Infinity, worldMaxY = -Infinity;
+        
+        for (let st of copyBuffer.strokes) {
+            const newStroke = {
+                type: st.type,
+                worldWidth: st.worldWidth,
+                points: st.points.map(p => ({ x: p.x + offsetXWorld, y: p.y + offsetYWorld }))
+            };
+            updateStrokeBBox(newStroke);
+            newStrokes.push(newStroke);
+            const b = newStroke.bbox;
+            if (b.minX < worldMinX) worldMinX = b.minX;
+            if (b.minY < worldMinY) worldMinY = b.minY;
+            if (b.maxX > worldMaxX) worldMaxX = b.maxX;
+            if (b.maxY > worldMaxY) worldMaxY = b.maxY;
+        }
+        for (let pin of copyBuffer.pins) {
+            const newPin = {
+                id: nextPinId++,
+                x: pin.x + offsetXWorld,
+                y: pin.y + offsetYWorld,
+                name: pin.name,
+                level: pin.level
+            };
+            newPins.push(newPin);
+            if (newPin.x - PIN_RADIUS_WORLD < worldMinX) worldMinX = newPin.x - PIN_RADIUS_WORLD;
+            if (newPin.y - PIN_RADIUS_WORLD < worldMinY) worldMinY = newPin.y - PIN_RADIUS_WORLD;
+            if (newPin.x + PIN_RADIUS_WORLD > worldMaxX) worldMaxX = newPin.x + PIN_RADIUS_WORLD;
+            if (newPin.y + PIN_RADIUS_WORLD > worldMaxY) worldMaxY = newPin.y + PIN_RADIUS_WORLD;
+        }
+        
+        const oldStrokeCount = strokes.length;
+        const oldPinCount = pins.length;
+        const cmds = [];
+        
+        for (let i = 0; i < newStrokes.length; i++) {
+            cmds.push(new AddStrokeCommand(newStrokes[i], oldStrokeCount + i, true));
+        }
+        for (let i = 0; i < newPins.length; i++) {
+            cmds.push(new AddPinCommand(newPins[i], oldPinCount + i));
+        }
+        
+        if (cmds.length === 0) return;
+        const compositeCmd = new CompositeCommand(cmds);
+        executeCommand(compositeCmd);
+        
+        if (worldMinX !== Infinity) {
+            const worldRect = { minX: worldMinX - 5, minY: worldMinY - 5, maxX: worldMaxX + 5, maxY: worldMaxY + 5 };
+            updateBackgroundCacheInRect(worldRect);
+            const topLeft = worldToScreen(worldRect.minX, worldRect.minY);
+            const bottomRight = worldToScreen(worldRect.maxX, worldRect.maxY);
+            const dirtyScreen = {
+                x: Math.floor(topLeft.x - 2),
+                y: Math.floor(topLeft.y - 2),
+                w: Math.ceil(bottomRight.x - topLeft.x + 4),
+                h: Math.ceil(bottomRight.y - topLeft.y + 4)
+            };
+            if (dirtyScreen.w > 0 && dirtyScreen.h > 0) {
+                addDirtyRect(dirtyScreen);
+            }
+        } else {
+            bgCacheValid = false;
+            fullRepaint();
+        }
+        
+        const newStrokesIndices = [];
+        for (let i = 0; i < newStrokes.length; i++) {
+            newStrokesIndices.push(oldStrokeCount + i);
+        }
+        const newPinsIndices = [];
+        for (let i = 0; i < newPins.length; i++) {
+            newPinsIndices.push(oldPinCount + i);
+        }
+        
+        clearSelection();
+        for (let idx of newStrokesIndices) {
+            selectedItems.add('s' + idx);
+        }
+        for (let idx of newPinsIndices) {
+            selectedItems.add('p' + idx);
+        }
+        recomputeSelectionBounds();
+        selectionRotation = 0;
+        rebuildStrokeGrid();
+        addDirtyRectForSelectionAndControls();
+        flushRendering();
+        updatePinsListUI();
+        updateBottomPanel();
+    }
+    
     function onKeyDown(e){ 
         if(isNameModalActive){ if(e.code==='Escape' && modalMask) modalMask.click(); return; }
         if(e.code === 'ShiftLeft' || e.code === 'ShiftRight') { shiftPressed = true; return; }
@@ -1899,6 +2571,8 @@
         if(e.code==='KeyE'){ e.preventDefault(); setTool('eraser',false); return; }
         if(e.code==='KeyL'){ e.preventDefault(); setTool('lasso',false); return; }
         if(e.code==='KeyP'){ e.preventDefault(); setTool('pin',false); return; }
+        if(e.ctrlKey && e.code === 'KeyC'){ e.preventDefault(); copySelected(); return; }
+        if(e.ctrlKey && e.code === 'KeyV'){ e.preventDefault(); paste(); return; }
         if(e.ctrlKey&&e.code==='KeyZ'){ e.preventDefault(); undo(); return; }
         if(e.ctrlKey&&e.code==='KeyY'){ e.preventDefault(); redo(); return; }
         if(e.code==='Delete'||e.code==='Backspace'){ if(selectedItems.size>0){ e.preventDefault(); deleteSelected(); } }
@@ -1920,22 +2594,38 @@
             shapeRecogTimer = null;
         }
         if(currentStroke.type === 'eraser') {
-            const changes = collectEraserChanges(currentStroke);
-            if(changes.toDelete.length) {
-                const cmd = new DeleteStrokesCommand(changes.toDelete);
-                executeCommand(cmd);
-            }
+            const eraserStroke = currentStroke;
             currentStroke = null;
             isDrawing = false;
-            fullRepaint();
+            
+            const eraserBounds = getStrokeScreenBounds(eraserStroke);
+            if (eraserBounds) addDirtyRect(eraserBounds);
+            
+            const changes = collectEraserChanges(eraserStroke);
+            if(changes.toDelete.length) {
+                const dirtyWorldRect = getWorldRectFromStrokes(changes.toDelete);
+                const cmd = new DeleteStrokesCommand(changes.toDelete, dirtyWorldRect);
+                executeCommand(cmd);
+            } else {
+                flushRendering();
+            }
             updateCursorVisibility();
             strokeModifiedByRecog = false;
             return;
         }
+        
+        if(currentStroke.type === 'pencil' && currentStroke.points.length === 1) {
+            const singlePoint = currentStroke.points[0];
+            const eps = 1e-6;
+            const secondPoint = { x: singlePoint.x + eps, y: singlePoint.y + eps };
+            currentStroke.points.push(secondPoint);
+            currentStroke.rawPoints.push(secondPoint);
+        }
+        
         if(currentStroke.points.length >= 2){
             const newStroke = {
                 type: currentStroke.type,
-                baseWidth: currentStroke.baseWidth,
+                worldWidth: currentStroke.worldWidth,
                 points: currentStroke.points.slice()
             };
             updateStrokeBBox(newStroke);
@@ -1947,8 +2637,12 @@
                 const boundsWorld = newStroke.bbox;
                 const topLeft = worldToScreen(boundsWorld.minX, boundsWorld.minY);
                 const bottomRight = worldToScreen(boundsWorld.maxX, boundsWorld.maxY);
-                const dirtyRect = { x: topLeft.x, y: topLeft.y, w: bottomRight.x - topLeft.x, h: bottomRight.y - topLeft.y };
-                if (dirtyRect.w > 0 && dirtyRect.h > 0) {
+                let x = Math.floor(topLeft.x - 2);
+                let y = Math.floor(topLeft.y - 2);
+                let w = Math.ceil(bottomRight.x - topLeft.x + 4);
+                let h = Math.ceil(bottomRight.y - topLeft.y + 4);
+                if (w > 0 && h > 0) {
+                    const dirtyRect = { x, y, w, h };
                     bgCtx.save();
                     bgCtx.beginPath();
                     bgCtx.rect(dirtyRect.x, dirtyRect.y, dirtyRect.w, dirtyRect.h);
